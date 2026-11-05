@@ -21,7 +21,7 @@
 #
 # **学完你能回答：**
 # 1. 100 QPS、p95 TTFT < 500 ms、TPOT < 50 ms、2K 上下文，需要几台什么卡？
-# 2. 8B fp16、8B int4、27B int4 三个方案，每百万 token 成本差多少？为什么 int4 不一定最便宜？
+# 2. 8B fp16、8B int4、27B int4 三个方案，每百万总 token 成本差多少？为什么 int4 不一定最便宜？
 # 3. 哪些假设最危险？上云第一天应该先量哪三个数来校准这份表格？
 # 4. QPS 或上下文翻倍时，成本和实例数会怎么变？哪个方案最先撑不住？
 
@@ -145,8 +145,10 @@
 # | B | 8B | int4（0.5 B/参数） | 1×A100 | 权重省 12 GB，KV 不变 |
 # | C | 27B | int4（0.5 B/参数） | 2×A100（TP=2） | 质量更好，卡数翻倍 |
 #
-# 27B 的 KV 按 46 层、8 KV head、head_dim=128 估；int4 用 0.5 B/参数（含零点/缩放开销，
-# 比理论 0.25 B 更保守）。判定口径有三条：延迟 SLO、月预算、每百万 token 成本。
+# 27B 的 KV 按 46 层、8 KV head、head_dim=128 估（**这是假设值**：27B 不是公开型号，层数按规模内插；
+# 层数只影响 KV 账本，不影响选型逻辑）。int4 用 0.5 B/参数——4 bit 的理论下限就是 0.5 B
+# （0.25 B 是 2-bit），实际 kernel 还要额外存零点/缩放，所以有效字节会略高于 0.5。
+# 判定口径有三条：延迟 SLO、月预算、每百万总 token 成本。
 #
 # %% [markdown]
 # ### 数据流与验收标准
@@ -290,7 +292,7 @@ def plan_capacity(
         "实例数": instances,
         "GPU 总数": instances * tp,
         "月成本($)": monthly,
-        "每百万 token 成本($)": monthly / monthly_tokens_m,
+        "每百万总 token 成本($)": monthly / monthly_tokens_m,
         "TTFT 达标": prefill_ms <= wl.ttft_budget_ms,
         "TPOT 达标": step_ms <= wl.tpot_budget_ms,
         "预算达标": monthly <= wl.budget_usd_month,
@@ -425,9 +427,9 @@ rows = [{"方案": name, **{k: round(v, 2) if isinstance(v, float) else v for k,
         for name, kw in PLANS.items()]
 compare_df = pd.DataFrame(rows)[
     ["方案", "单卡权重(GB)", "每请求 KV(MB)", "并发上限", "单步 TPOT(ms)", "TTFT 估计(ms)",
-     "实例数", "GPU 总数", "月成本($)", "每百万 token 成本($)", "TTFT 达标", "TPOT 达标", "预算达标"]
+     "实例数", "GPU 总数", "月成本($)", "每百万总 token 成本($)", "TTFT 达标", "TPOT 达标", "预算达标"]
 ]
-per_m = dict(zip(compare_df["方案"], compare_df["每百万 token 成本($)"]))
+per_m = dict(zip(compare_df["方案"], compare_df["每百万总 token 成本($)"]))
 assert compare_df[["TTFT 达标", "TPOT 达标"]].all().all(), "三个方案都应满足延迟 SLO"
 assert per_m["B 8B int4 ×1"] < per_m["A 8B fp16 ×1"] < per_m["C 27B int4 ×2"]
 compare_df
@@ -440,6 +442,10 @@ compare_df
 # | A 8B fp16 ×1 | $11,096 | $0.054 | ✅ | ❌ 超 11% | 质量基线；减 QPS 或换 int4 才可行 |
 # | B 8B int4 ×1 | $8,322 | $0.040 | ✅ | ✅ 余 17% | **推荐**；风险：int4 精度损失需评测集验证 |
 # | C 27B int4 ×2 | $16,644 | $0.081 | ✅ | ❌ 超 66% | 质量上限；TP=2 通信与 12 卡故障域是额外风险 |
+#
+# **口径提醒**：这张表的 `$/M` 按**输入+输出**的总 token 计（这样和云账单对得上）；
+# 第 10 章的 `$/M` 按**输出** token 计。两者不能直接比较——本场景平均 2348 输入 + 300 输出，
+# 换算约差 7.8 倍。对客户报价用总 token，算毛利用输出 token。
 #
 # 先猜后验的答案是 **(b) $8.3k**。选 (a) 的人把「模型小 4 倍」直接换算成了「便宜 4 倍」；
 # 但 decode 每步要读的是**权重 + 全部在途 KV**：权重从 16 GB 降到 4 GB，省下的 12 GB 全变成了
@@ -496,15 +502,16 @@ axes[0].set_ylabel("Instances required")
 axes[0].set_title("Instance count is a step function")
 axes[1].set_xlabel("Peak QPS")
 axes[1].set_ylabel("Monthly cost (USD)")
-axes[1].set_title("Monthly cost: plan B stays under budget up to 160 QPS")
+axes[1].set_title("Monthly cost vs peak QPS (budget $10k)")
 for ax in axes:
     ax.legend(fontsize=8)
 save(fig, "ch14_capacity_curve");
 
 # %% [markdown]
-# **读图**：**B 方案在 160 QPS 才接近预算线**（约 $13.9k），而 A 在 100 QPS 就超了，
-# C 在 60 QPS 就超了。这个交叉点就是谈判筹码：如果业务承诺「峰值不超过 80 QPS」，
-# A 也能压进预算；如果能接受 8B 的质量，B 是唯一有成本余量的方案。
+# **读图**：B 方案的预算窗口是**峰值 ≤ 100 QPS**——100 QPS 时 $8,322（余 17%），
+# 到 120 QPS 需要 8 台实例、$11,096，已经破了 $10k；160 QPS 是 10 台、约 $13.9k（超 39%）。
+# A 在 100 QPS 就超 11%，C 在 60 QPS 就超 66%。所以真正的谈判筹码是「峰值能不能压到 100 QPS
+# 以内」：能，B 是唯一有成本余量的方案；不能，就得先谈预算或压精度。
 #
 # 还要记住这张图的**三个未建模项**，上云后必须用压测校准：
 #
@@ -559,7 +566,7 @@ save(fig, "ch14_capacity_curve");
 # **你现在应该能回答：**
 #
 # - 为什么「单卡放得下」不等于「单卡能扛 QPS」？两个约束分别是什么？
-# - 为什么 int4 能让每百万 token 成本降 25%，但 27B int4 反而更贵？
+# - 为什么 int4 能让每百万总 token 成本降 25%，但 27B int4 反而更贵？
 # - 如果 p95 TTFT 实测比估算高 2 倍，你应该先查哪三个参数？
 #
 # **小结**

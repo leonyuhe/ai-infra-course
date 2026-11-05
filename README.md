@@ -74,7 +74,7 @@ make execute     # 无头执行全部 15 章（约 40 秒）
 
 ![Architecture](assets/figures/ch09_architecture.svg)
 
-| # | 章节 | 核心问题 | 本章实测结论（M3 Ultra） |
+| # | 章节 | 核心问题 | 本章结论（来源见下方注） |
 | --- | --- | --- | --- |
 | 00 | [环境、硬件与度量方法](notebooks/00_setup_and_measurement.ipynb) | 怎么测才可信？ | 不同步的计时低估 **30×**；p90 决定 SLO |
 | 01 | [一次前向：从矩阵乘法到 token 采样](notebooks/01_forward_and_sampling.ipynb) | prefill/decode 的瓶颈为什么不同？ | 实测带宽 ≈500–550 GB/s；decode 是带宽 bound |
@@ -91,6 +91,9 @@ make execute     # 无头执行全部 15 章（约 40 秒）
 | 12 | [多卡并行](notebooks/12_multi_gpu.ipynb) | TP/PP/DP 切的是什么？通信多贵？ | TP=8 扩展效率 NVLink 0.89 / 以太网 0.50 |
 | 13 | [训练侧 infra](notebooks/13_training_infra.ipynb) | DDP/ZeRO 的显存账本、LoRA 闭环 | 7B/8 卡：DDP 112GB → ZeRO-3 14GB；LoRA 合并等价 |
 | 14 | [Capstone：容量规划](notebooks/14_capstone.ipynb) | 给定 SLO 和预算，怎么选卡？ | 8B int4 方案 $8.3k/月满足 100 QPS |
+
+**结论来源**：00–09 是本地实机实测（05/06/09 是调度模拟器的实测）；10–11 是 A100 fixture 回放
+（字段结构复刻 vLLM 响应，数值非本机实测）；12–14 是公式推算。每章正文都会标明当前数字的来源。
 
 完整设计（教学法、验收标准、6 天排期）见 [COURSE_DESIGN.md](COURSE_DESIGN.md)；
 写作与代码规范见 [STYLE_GUIDE.md](STYLE_GUIDE.md)。
@@ -112,7 +115,7 @@ make execute     # 无头执行全部 15 章（约 40 秒）
 CHAPTER_PATTERN.md  统一的章节写作模式（目标→设计→分步→实验）
 aiinfra/            共享库：TinyGPT（含 KV cache 接口）、bench、plotting
 notebooks/          章节源文件 .py（percent 格式）+ 构建产物 .ipynb
-assets/figures/     手绘 SVG 概念图（17 张，全英文图内文字）
+assets/figures/     手绘 SVG 概念图（18 张，全英文图内文字）
 solutions/          练习参考答案（02–14 章）
 cloud/              云上执行资产：Docker、起服务/压测/多卡/LoRA 脚本、fixture、成本表
 tools/              build / execute / check / test_lib
@@ -128,7 +131,7 @@ outputs/            Notebook 运行生成的图表（gitignore）
 ## 课程状态
 
 - [x] 00–14 全部 15 章
-- [x] 17 张概念图 + 30+ 张实测图
+- [x] 18 张概念图 + 30+ 张实测图
 - [x] 13 份练习答案
 - [x] 云上脚本与文档
 - [x] v0.2 全书叙述重写：场景钩子、先猜后验、⚠️ 坑、时间轴、收尾三件套

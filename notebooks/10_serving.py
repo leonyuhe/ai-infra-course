@@ -452,14 +452,14 @@ print(f"成功 {len(ok)}/10；首包中位数 {ok['首 token/首包(ms)'].median
 # 所以 int4 的 8B 在 24GB 卡上能跑，KV 空间主要来自「省下来的权重」。
 #
 # 把账换算成人话：8B 在 fp16 下权重 16.4 GB，80GB 卡按 util=0.90 有 72 GB 可用，
-# 减掉 2 GB 预留，留给 KV 的是 55.6 GB；换成 24GB 卡（可用 21.6 GB），只剩 3.2 GB。
-# **同一份权重，换一张卡，草稿纸从 55.6 GB 缩到 3.2 GB**——这就是「能跑」和「能开多少并发」
+# 减掉 2 GB 预留，留给 KV 的是 53.6 GB；换成 24GB 卡（可用 21.6 GB），只剩 3.2 GB。
+# **同一份权重，换一张卡，草稿纸从 53.6 GB 缩到 3.2 GB**——这就是「能跑」和「能开多少并发」
 # 之间那道鸿沟。
 
 # %%
 MODELS = {
     "Qwen3-8B": {"params": 8.2e9, "n_layer": 36, "n_kv_head": 8, "head_dim": 128},
-    "Qwen3-27B": {"params": 27.0e9, "n_layer": 64, "n_kv_head": 8, "head_dim": 128},
+    "假设 27B（64 层）": {"params": 27.0e9, "n_layer": 64, "n_kv_head": 8, "head_dim": 128},
 }
 WEIGHT_BYTES = {"fp16": 2, "int8": 1, "int4": 0.5}
 UTIL, OVERHEAD_GB = 0.90, 2.0

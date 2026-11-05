@@ -311,7 +311,7 @@ save(fig, "ch00_littles_law");
 # | 我们的概念 | vLLM 中的名字 | 位置 |
 # | --- | --- | --- |
 # | 预热 | benchmark 的 warmup 阶段 | `vllm/benchmarks/serve.py` |
-# | TTFT | `ttft`（time to first token） | `vllm/engine/metrics.py` |
+# | TTFT | `ttft`（time to first token） | `vllm/v1/metrics/` |
 # | TPOT | `tpot`（time per output token） | 同上 |
 # | p50/p90/p99 | `--metric-percentiles 50,90,99` | `vllm bench serve` 参数 |
 # | 实时并发 | `vllm:num_requests_running` | Prometheus 指标 |

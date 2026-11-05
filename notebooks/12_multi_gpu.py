@@ -323,7 +323,7 @@ for tp in (2, 4, 8):
     outs = ring_allreduce(parts)
     err = max((o - expect).abs().max().item() for o in outs)
     assert all(torch.allclose(o, expect, atol=1e-4) for o in outs), f"TP={tp} ring all-reduce 结果错误"
-    print(f"✅ TP={tp}: 8 个 rank 的 ring all-reduce 与串行求和一致，最大误差 {err:.2e}")
+    print(f"✅ TP={tp}: {tp} 个 rank 的 ring all-reduce 与串行求和一致，最大误差 {err:.2e}")
 
 # %% [markdown]
 # ### Step 4 · 参数化通信模型

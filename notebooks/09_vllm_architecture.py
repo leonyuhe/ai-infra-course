@@ -166,7 +166,7 @@
 # | Step 2 块池 | `ensure` 失败时不占块；`release` 后 `free + used == total` |
 # | Step 3 调度 | 每步 token 总数 ≤ `max_num_batched_tokens`；running ≤ `max_num_seqs` |
 # | Step 4 模拟 | 所有请求都完成；峰值块 ≤ 块池容量；KV 不足时抢占次数 > 0 |
-# | 实验 A/B/C | 四策略吞吐排序正确；轨迹第 7 步后进入纯 decode；sweep 单调 |
+# | 实验 A/B/C | 四策略吞吐排序正确；轨迹第 17 步后进入纯 decode；sweep 单调 |
 
 # %% [markdown]
 # ## 09.3 从零实现：分四步
@@ -535,7 +535,7 @@ save(fig, "ch09_policy_compare")
 # %% [markdown]
 # ### 实验 B · 调度轨迹：一步里发生了什么
 #
-# **先猜一下**：前几步单步 300–340 ms，这段时间主要在干什么？
+# **先猜一下**：前几步单步最长约 276 ms，这段时间主要在干什么？
 # (a) decode 那几十个请求　(b) 8192 token 的 prefill 预算　(c) 调度器在算。
 #
 # 协议：用 vLLM 默认参数跑同一负载，记录前 12 步的 running / waiting / prefill token /
@@ -550,11 +550,12 @@ print(f"总迭代 {len(trace_df)} 步；KV 峰值 {res_trace['peak_blocks']} 块
 trace_df.head(12)
 
 # %% [markdown]
-# **读数**：回收上个猜测——答案是 (b)。前 6 步把 8192 token 预算几乎全花在 prefill 上，
-# 8192 × 0.04 ms = 327.7 ms，和单步 300–340 ms 对得上；第 7 步后进入纯 decode，
-# 一步 17.6 ms ≈ `8.0 + 0.12 × 80`。这就是「prefill 贵、decode 按并发摊薄」的量化版本，
-# 也是 TTFT 和 TPOT 由不同阶段决定的直接证据。选 (a) 的直觉是「几十个请求都在等，肯定在
-# decode」——实际上前几步连一个 decode 都塞不进去，8192 token 的预算全被 prefill 吃掉了。
+# **读数**：回收上个猜测——答案是 (b)。前 16 步都是**混合批**：每一步里既有 prefill 又有
+# decode，单步耗时 32–276 ms，prefill token 数从 812 一路爬到峰值 6571（第 13 步）再回落；
+# 第 17 步起 prefill 全部做完，变成纯 decode——一步 17.6 ms ≈ `8.0 + 0.12 × 80`。
+# 这就是「prefill 贵、decode 按并发摊薄」的量化版本，也是 TTFT 和 TPOT 由不同阶段决定的
+# 直接证据。选 (a) 的直觉是「几十个请求都在等，肯定在 decode」——实际上前 16 步里 decode
+# 请求数从 0 涨到 73，prefill 一直在抢预算，直到第 17 步才彻底让位。
 #
 # 更值得记的是 decode 这一行：80 个请求同时 decode，一步 17.6 ms；而单独一个请求，一步是
 # 8.0 + 0.12 = 8.12 ms。把 80 个请求打包之后，单请求单 token 的成本从 8.12 ms 摊到
@@ -641,7 +642,7 @@ save(fig, "ch09_scheduler_sweep")
 # | --- | --- | --- | --- |
 # | `KVCache`（02） | `KVCacheManager` + `BlockPool` + attention backend 的 KV 读写 | `vllm/v1/core/kv_cache_manager.py` / `block_pool.py` | 块表由 kernel 直接寻址；支持多种 attention 后端与异构层 |
 # | `BlockManager`（03） | `KVCacheManager.allocate_slots()` / `free()` | 同上 + `vllm/v1/core/kv_cache_utils.py` | 按 `KVCacheSpec` 自动算块数，支持 sliding window / Mamba 等异构层 |
-# | `HashPrefixCache`（04） | 前缀缓存（block hash）+ `--enable-prefix-caching` | `vllm/v1/core/kv_cache_manager.py`（`get_computed_blocks`） | 跨请求/跨进程共享，且与抢占、调度器协同 |
+# | `PrefixCache`（04） | 前缀缓存（block hash）+ `--enable-prefix-caching` | `vllm/v1/core/kv_cache_manager.py`（`get_computed_blocks`） | 跨请求/跨进程共享，且与抢占、调度器协同 |
 # | `Scheduler`（05） | `Scheduler.schedule()` | `vllm/v1/core/sched/scheduler.py` | 优先级/FCFS 队列、token 预算、抢占、结构化输出约束 |
 # | `chunked prefill` + 抢占（06） | chunked prefill + `PreemptionMode.RECOMPUTE` | 同上 | 与前缀缓存、spec decode、LoRA 同时工作 |
 # | `Request` 数据类（05） | `Request` + `RequestStatus` | `vllm/v1/request.py` | 状态机、多模态输入、spec token、采样参数 |

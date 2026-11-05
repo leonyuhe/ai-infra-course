@@ -576,14 +576,14 @@ tiny = TinyGPT(cfg).to(device).eval()
 
 @torch.no_grad()
 def decode_loop(batch: int, steps: int = 20, ctx: int = 32):
-    cache = KVCache(cfg, batch_size=batch, max_seq_len=ctx + steps + 1, device=device)
-    tiny(torch.randint(0, cfg.vocab_size, (batch, ctx), device=device), start_pos=0, kv_cache=cache)
-    tok = torch.randint(0, cfg.vocab_size, (batch, 1), device=device)
-    pos = cache.seq_len
-
     def fn():
+        cache = KVCache(cfg, batch_size=batch, max_seq_len=ctx + steps + 1, device=device)
+        tiny(torch.randint(0, cfg.vocab_size, (batch, ctx), device=device), start_pos=0, kv_cache=cache)
+        cache.advance(ctx)                     # prefill 的 32 个 token 必须先推进长度
+        tok = torch.randint(0, cfg.vocab_size, (batch, 1), device=device)
         for _ in range(steps):
-            tiny(tok, start_pos=pos, kv_cache=cache)
+            tiny(tok, start_pos=cache.seq_len, kv_cache=cache)
+            cache.advance(1)                   # 每步只追加 1 个 token
     return fn
 
 
@@ -596,12 +596,12 @@ df_cal["实测/模型"] = df_cal["实测单步(ms)"] / df_cal["模型单步(ms)"
 df_cal.round(3)
 
 # %% [markdown]
-# **读表**：batch 从 1 到 32，TinyGPT 的每步耗时只涨了约 5%（中间点有 ±25% 的噪声），
-# 而线性增长会是 32 倍。模型预测的 6.1–9.8ms 与实测的 1.0–1.3ms 差一个固定常数——
-# TinyGPT 只有 2.8M 参数，本机 MPS 也不是 A100。**绝对值对不上不影响结论**：
+# **读表**：batch 从 1 到 32，TinyGPT 的每步耗时从 3.3 ms 只涨到 3.7 ms（约 12%，中间点有 ±25% 的噪声），
+# 而线性增长会是 32 倍。模型预测的 6.1–9.8 ms 系统性高于实测——因为 MPS 上小模型每步有约 2–3 ms 的
+# 固定开销（Python 调用 + kernel 启动 + 同步），这部分「理论单步」里根本没算。**绝对值对不上不影响结论**：
 # 两者都远低于线性增长，亚线性假设成立，后面只比较相对倍数。
 #
-# （回到上面的先猜）答案是 (a)：按成本模型，6.12ms → 9.84ms 约 1.6 倍，实测更极端，只涨 5%。
+# （回到上面的先猜）答案是 (a)：按成本模型，6.12ms → 9.84ms 约 1.6 倍，实测更极端，1→32 只涨了约 12%。
 # 选 (c) 看起来对，是因为把 decode 想成了「32 条序列各跑一遍模型」；实际上 32 条序列挤在同一次前向里，
 # 权重只读一遍，多出来的只是 32 份 KV 读取与乘加。选 (b) 则是拿「请求数」当「工作量」——
 # decode 的工作量是**读多少字节**，不是有多少条请求。

@@ -175,7 +175,7 @@
       "ttft_p99_ms": 930,
       "tpot_p50_ms": 39.0,
       "output_throughput_tok_s": 812,
-      "kv_cache_usage_pct_peak": 81,
+      "kv_cache_usage_pct_peak": 76,
       "num_requests_waiting_max": 4,
       "note": "基本持平"
     },
@@ -186,7 +186,7 @@
       "ttft_p99_ms": 921,
       "tpot_p50_ms": 38.2,
       "output_throughput_tok_s": 812,
-      "kv_cache_usage_pct_peak": 55,
+      "kv_cache_usage_pct_peak": 81,
       "num_requests_waiting_max": 4,
       "note": "默认值（本负载已饱和）"
     }

@@ -5,9 +5,31 @@
 
 ## 当前同步状态（remote）
 
-- 最后推送 commit：`7b17e37`（ch01 的 prefill/decode 重写、ch05 措辞、站点 CI 提示条）
-- 在线站与 Release PDF（227 页）已包含到该 commit 为止的内容
-- 之后的改动都只在本地
+- v0.2.0 已发布（commit + tag `v0.2.0` + Release PDF 311 页 + Pages 重建）
+- 上一版：v0.1.1（结构重排），再上一版 v0.1.0
+
+## v0.2.0 发布前技术校核（第二轮，2026-11-06）
+
+两个独立审稿人交叉复核，修掉 16 处确认的错误（明细见 `dist/RELEASE_NOTES_v0.2.0.md`）：
+
+| 文件 | 改动 | 类型 |
+| --- | --- | --- |
+| `notebooks/10_serving.py` | KV 预算 55.6 → 53.6 GB | 算术 |
+| `notebooks/13_training_infra.py` | `min_gpus` ZeRO-1 的 fixed 补上梯度（2B → 4B/参数） | 代码 bug |
+| `notebooks/14_capstone.py` | 图题与读数改为「100 QPS 才是预算窗口」；int4 0.25B 说法纠正；`$/M` 明确为总 token 口径 | 结论/口径 |
+| `notebooks/09_vllm_architecture.py` | 轨迹读数按实跑改写（16 步混批 / 第 17 步纯 decode / 峰值 6571）；`HashPrefixCache`→`PrefixCache` | 数字/命名 |
+| `notebooks/05_scheduler.py` | decode 基准补 `cache.advance()`，读数由 1.0–1.3ms 更新为 3.3–3.7ms（+12%） | 代码 bug |
+| `notebooks/08_speculative_decoding.py` | 低温 α 统一 0.12；采样误差 0.45% | 数字 |
+| `notebooks/06_chunked_prefill.py` | A100 KV 容量统一 40 万 token | 数字 |
+| `notebooks/03_paged_attention.py` | 并发倍数 3.8 → 3.6 | 数字 |
+| `notebooks/01_forward_and_sampling.py` | 14800 改为公式外推（不再冒充观测） | 表述 |
+| `notebooks/07_quantization.py` | 理论达成率 0.5% → 约 1% | 数字 |
+| `notebooks/11_benchmarking.py`、`cloud/fixtures/benchmark_results.json` | 模型误差表述修正；参数扫描 KV 峰值改为单调（128→76%、256→81%） | 数字/数据 |
+| `notebooks/00_setup_and_measurement.py`、`11` | vLLM 指标路径统一 `vllm/v1/metrics/` | 事实 |
+| `notebooks/12_multi_gpu.py` | rank 数按 `{tp}` 打印 | 代码小 bug |
+| `notebooks/10_serving.py`、`14` | 27B 标注为「假设模型（64/46 层）」，避免两章同名不同参 | 口径 |
+| `README.md` | 结论表头改为「来源见注」+ 增加来源说明；概念图 17 → 18 张 | 准确性 |
+| `dist/RELEASE_NOTES_v0.2.0.md` | 新增 v0.2.0 发布说明 | 文档 |
 
 ## 待发布清单
 

@@ -321,7 +321,7 @@ def min_gpus(stage: int, params: float = 7e9, gpu_gb: float = 80.0, util: float 
             return 1
         return int(np.ceil(16 * train / 1e9 / (budget - 2 * frozen / 1e9)))
     if stage == 1:  # 参数 + 梯度固定，优化器状态（12B/参数）除以 N
-        fixed, sharded = 2 * (frozen + train) / 1e9, 12 * train / 1e9
+        fixed, sharded = 4 * (frozen + train) / 1e9, 12 * train / 1e9
     else:  # stage 2：参数固定，梯度 + 优化器状态（14B/参数）除以 N
         fixed, sharded = 2 * (frozen + train) / 1e9, 14 * train / 1e9
     if fixed >= budget:
