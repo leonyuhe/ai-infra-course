@@ -444,71 +444,150 @@ print(f"对应权重读取带宽: {achieved_bw:.1f} GB/s  (实测峰值 {bw_meas
 # 所以性能估算要"账本推算 + 大模型实测"结合，不能拿玩具模型的绝对值外推。
 
 # %% [markdown]
-# ### 实测 4：把两种负载放到 roofline 上
+# ### 实测 4：把"搬数据"和"算数"放到一张图上（roofline）
 #
-# 用实测带宽和实测算力画图，再把 8B 模型（fp16）的 decode/prefill 位置标上去。
+# 你的理解是对的：一次前向的时间，就是**搬数据时间和计算时间取较大者**。
+#
+# ```
+# 搬数据时间 = 要读写的字节数 ÷ 有效带宽
+# 计算时间   = 要做的浮点运算数 ÷ 有效算力
+# 实际耗时   ≈ max(搬数据时间, 计算时间)   ← 两者可部分重叠，先记住这个上界
+# ```
+#
+# 谁更大，取决于"每读 1 字节能做多少次浮点运算"——这个比值叫**算术强度（AI）**：
+#
+# ```
+# AI = FLOPs ÷ 字节数
+# 内存受限：耗时由搬数据决定 → 可达性能 = 带宽 × AI
+# 计算受限：耗时由算力决定   → 可达性能 = 峰值 FLOPS
+# ```
+#
+# roofline 图就是把这两条上限画在一起，实际性能取较低的那条。横轴是 AI，纵轴是每秒浮点运算数。
+
+# %% [markdown]
+# 怎么读这张图：
+#
+# - **横轴（对数）**：每读 1 字节能做多少次浮点运算，越往右越"值钱"；
+# - **纵轴（对数）**：每秒能完成多少浮点运算（TFLOP/s）；
+# - **红色斜线**：只被带宽限制时，性能 = `带宽 × AI`；
+# - **紫色横线**：算力上限；
+# - **曲线**：取两者较小值，所以"先斜后平"。
+#
+# 两条线的交点叫**平衡点** `AI* = 峰值 FLOPS ÷ 带宽`。
+# 在平衡点左边（AI 小）是内存受限，右边（AI 大）是计算受限。
 
 # %%
 a = torch.randn(4096, 4096, device=device)
 r = bench(lambda: a @ a, name="4096 matmul", warmup=2, reps=5, device=device)
 peak_tflops = 2 * 4096**3 / (r.median_ms / 1000) / 1e12
-
-P = 8e9          # 8B 参数
-bytes_per_param = 2  # fp16
-ai = np.logspace(-1, 4, 200)
-roof = np.minimum(bw_measured * 1e9 * ai, peak_tflops * 1e12) / 1e12
-
-fig, ax = plt.subplots(figsize=(7.2, 4.4))
-ax.loglog(ai, roof, color="#2563EB", lw=2.5, label="Achievable performance")
-ax.axhline(peak_tflops, color="#7C3AED", ls="--", lw=1.5, label=f"Compute roof ≈ {peak_tflops:.1f} TFLOP/s")
-ax.axvline(1, color="#9CA3AF", ls=":", lw=1)
-
-decode_ai = 2 * P / (P * bytes_per_param)   # ≈ 1 FLOP/byte
-decode_y = min(bw_measured * 1e9 * decode_ai, peak_tflops * 1e12) / 1e12
-ax.scatter([decode_ai], [decode_y], s=90, color="#EF4444", zorder=5)
-ax.annotate("decode (8B, fp16)\nmemory-bound", (decode_ai, decode_y), xytext=(2, 6),
-            fontsize=10, color="#991B1B", arrowprops=dict(arrowstyle="->", color="#EF4444"))
-
-prefill_ai = 2048.0
-prefill_y = min(bw_measured * 1e9 * prefill_ai, peak_tflops * 1e12) / 1e12
-ax.scatter([prefill_ai], [prefill_y], s=90, color="#10B981", zorder=5)
-ax.annotate("prefill (T=2048)\ncompute-bound", (prefill_ai, prefill_y), xytext=(60, prefill_y * 0.12),
-            fontsize=10, color="#065F46", arrowprops=dict(arrowstyle="->", color="#10B981"))
-
-ax.set_xlabel("Arithmetic intensity (FLOP/byte)")
-ax.set_ylabel("Achievable performance (TFLOP/s)")
-ax.set_title("Roofline: prefill and decode hit different walls")
-ax.legend(loc="lower right", fontsize=9)
-ax.grid(True, which="both", alpha=0.3)
-save(fig, "ch01_roofline");
+print(f"实测峰值算力 ≈ {peak_tflops:.1f} TFLOP/s | 实测带宽 ≈ {bw_measured:.0f} GB/s")
+print(f"平衡点 AI* ≈ {peak_tflops * 1e12 / (bw_measured * 1e9):.0f} FLOP/byte")
 
 # %% [markdown]
-# 结论表：用实测参数推算 8B 模型，看看理论上限和"你实际会看到的数字"差多少。
+# 把 8B fp16 模型的两种负载代入公式，直接算"两个时间"：
 
 # %%
-theory = pd.DataFrame(
+P = 8e9
+bytes_per_param = 2
+weights_bytes = P * bytes_per_param
+per_token_flops = 2 * P
+
+
+def breakdown(name: str, flops: float, nbytes: float) -> dict:
+    mem_ms = nbytes / (bw_measured * 1e9) * 1000
+    comp_ms = flops / (peak_tflops * 1e12) * 1000
+    return {
+        "场景": name,
+        "读取字节": f"{nbytes / 1e9:.1f} GB",
+        "FLOPs": (f"{flops / 1e12:.1f} TFLOP" if flops >= 1e12 else f"{flops / 1e9:.0f} GFLOP"),
+        "内存时间(ms)": round(mem_ms, 2),
+        "计算时间(ms)": round(comp_ms, 2),
+        "谁决定": "内存" if mem_ms > comp_ms else "计算",
+        "AI(FLOP/byte)": round(flops / nbytes, 1),
+    }
+
+
+time_df = pd.DataFrame(
     [
-        {
-            "场景": "8B fp16 decode（batch=1）",
-            "瓶颈": "带宽",
-            "理论值": f"{bw_measured * 1e9 / (P * 2):.1f} tokens/s",
-            "公式": "带宽 ÷ (参数量 × 2B)",
-        },
-        {
-            "场景": "8B fp16 prefill（T=2048）",
-            "瓶颈": "算力",
-            "理论值": f"{2 * P * 2048 / (peak_tflops * 1e12) * 1000:.1f} ms",
-            "公式": "2 × P × T ÷ 有效算力",
-        },
-        {
-            "场景": "KV cache（8B, 32 层, 8 KV heads, 128 dim, 4K ctx, fp16）",
-            "瓶颈": "容量",
-            "理论值": f"{2 * 32 * 8 * 128 * 4096 * 2 / 1024**3:.1f} GiB / 条请求",
-            "公式": "2 × L × H_kv × D × S × dtype",
-        },
+        breakdown("decode (batch=1)", per_token_flops, weights_bytes),
+        breakdown("prefill (T=2048)", per_token_flops * 2048, weights_bytes),
     ]
 )
-theory
+time_df
+
+# %%
+ai = np.logspace(-1, 4, 200)
+roof = np.minimum(bw_measured * 1e9 * ai, peak_tflops * 1e12) / 1e12
+balance_ai = peak_tflops * 1e12 / (bw_measured * 1e9)
+
+fig, ax = plt.subplots(figsize=(7.4, 4.6))
+ax.loglog(ai, roof, color="#2563EB", lw=2.5, label="achievable = min(BW x AI, peak)")
+ax.axhline(peak_tflops, color="#7C3AED", ls="--", lw=1.5, label=f"compute roof ~ {peak_tflops:.1f} TFLOP/s")
+ax.axvline(balance_ai, color="#9CA3AF", ls=":", lw=1)
+ax.annotate(
+    f"balance ~ {balance_ai:.0f} FLOP/byte",
+    (balance_ai, peak_tflops),
+    xytext=(-170, -46),
+    textcoords="offset points",
+    fontsize=9,
+    color="#6B7280",
+)
+for x, y, label, color in [
+    (1.0, min(bw_measured * 1e9, peak_tflops * 1e12) / 1e12, "decode\nmemory-bound", "#EF4444"),
+    (2048.0, peak_tflops, "prefill T=2048\ncompute-bound", "#10B981"),
+]:
+    ax.scatter([x], [y], s=80, color=color, zorder=5)
+    ax.annotate(label, (x, y), xytext=(8, 12), textcoords="offset points", fontsize=9, color=color)
+ax.set_xlabel("arithmetic intensity = FLOPs per byte read")
+ax.set_ylabel("achievable performance (TFLOP/s)")
+ax.set_title("Roofline: the lower ceiling wins")
+ax.legend(loc="lower right", fontsize=9)
+save(fig, "ch01_roofline");
+
+# %%
+labels = ["decode", "prefill (T=2048)"]
+mem = time_df["内存时间(ms)"].to_numpy()
+comp = time_df["计算时间(ms)"].to_numpy()
+xpos = np.arange(len(labels))
+width = 0.36
+
+fig, ax = plt.subplots(figsize=(7.2, 4.0))
+ax.bar(xpos - width / 2, mem, width, label="memory time", color="#EF4444")
+ax.bar(xpos + width / 2, comp, width, label="compute time", color="#2563EB")
+ax.set_yscale("log")
+ax.set_xticks(xpos, labels)
+ax.set_ylabel("time (ms, log scale)")
+ax.set_title("Same 8B weights, different bottleneck")
+ax.legend()
+for i, (m, c) in enumerate(zip(mem, comp)):
+    ax.text(i - width / 2, m * 1.25, f"{m:.1f}", ha="center", fontsize=9)
+    ax.text(i + width / 2, c * 1.25, f"{c:.1f}", ha="center", fontsize=9)
+save(fig, "ch01_time_breakdown");
+
+# %% [markdown]
+# 读表要点（8B fp16，数值随机器不同，比例关系是通用的）：
+#
+# - **decode**：每 token 读 16 GB 权重、只做 16 GFLOP，AI ≈ 1 → **内存时间远大于计算时间**，内存受限；
+# - **prefill T=2048**：权重还是 16 GB，但要算 32.8 TFLOP，AI ≈ 2048 → **计算时间远大于内存时间**，计算受限。
+#
+# 这就是 01.1 那句话的定量版本：prefill 也搬权重，但一次搬完被 2048 个 token 摊薄；
+# decode 每个 token 都要重新搬一遍，所以它卡在"搬"上。
+
+# %% [markdown]
+# ### 两个必须知道的修正
+#
+# **1. batch 会把 decode 往右推。** 一次 decode B 个请求时，权重只读一遍、被 B 个 token 摊薄：
+# 字节数几乎不变，FLOPs 变成 2·P·B，AI ≈ B。B 足够大时 decode 也会变成计算受限——
+# 这就是第 05 章连续批处理提升吞吐的物理基础，也是你说的"batch 像 prefill"的准确说法。
+#
+# **2. MoE 只读"被激活"的专家。** 总参数 100B 的 MoE，每个 token 可能只激活 10B：
+# 搬数据量和计算量都只按激活部分算，所以"总参数大"不等于"decode 一定卡带宽"。
+# 但路由和专家并行的通信开销是另一笔账（第 12 章会看到）。
+
+# %% [markdown]
+# 先用一句话总结本章：**prefill 是"一次搬、多次算"，decode 是"每次都搬、只算一次"**。
+# 所以 prefill 的优化方向是算力（更好的 kernel、更低精度），decode 的优化方向是带宽
+# （量化、GQA、batch、投机解码）。
 
 # %% [markdown]
 # ## 01.4 对照工业实现（vLLM）
