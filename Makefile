@@ -1,7 +1,7 @@
 # AI Infra 从零构建 · 常用命令
 PY := .venv/bin/python
 
-.PHONY: venv build check test execute all clean
+.PHONY: venv build check test execute site pdf all clean
 
 venv:
 	UV_CACHE_DIR="$(CURDIR)/.uv-cache" uv venv .venv --python 3.13
@@ -18,6 +18,12 @@ test:
 
 execute:
 	$(PY) tools/execute_notebooks.py --all --timeout 300
+
+site:
+	$(PY) tools/build_site.py --out _site
+
+pdf:
+	$(PY) tools/build_site.py --out _site --pdf dist/ai-infra-course-v0.1.0.pdf
 
 all: build check test execute
 

@@ -11,3 +11,7 @@ outputs/_preview/
 aiinfra_course.egg-info/
 .uv-cache/
 .ghconfig/
+_site/
+dist/
+outputs/_site_test/
+outputs/_chrome/

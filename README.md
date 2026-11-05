@@ -1,6 +1,11 @@
 # AI Infra 从零构建（From Scratch）
 
 ![ci](https://github.com/leonyuhe/ai-infra-course/actions/workflows/ci.yml/badge.svg)
+![pages](https://github.com/leonyuhe/ai-infra-course/actions/workflows/pages.yml/badge.svg)
+[![release](https://img.shields.io/github/v/release/leonyuhe/ai-infra-course)](https://github.com/leonyuhe/ai-infra-course/releases)
+
+**在线阅读：<https://leonyuhe.github.io/ai-infra-course/>** ｜
+**PDF 讲义：<https://github.com/leonyuhe/ai-infra-course/releases>**
 
 > 一套「先造轮子、再读工业实现」的 AI 推理基础设施课程。
 > 灵感来自 Sebastian Raschka 的 *Build a Large Language Model (From Scratch)*：
