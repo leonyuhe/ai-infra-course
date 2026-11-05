@@ -446,35 +446,45 @@ print(f"对应权重读取带宽: {achieved_bw:.1f} GB/s  (实测峰值 {bw_meas
 # %% [markdown]
 # ### 实测 4：把"搬数据"和"算数"放到一张图上（roofline）
 #
-# 你的理解是对的：一次前向的时间，就是**搬数据时间和计算时间取较大者**。
+# 一次前向的耗时，可以近似看成两个时间里的较大者：
 #
 # ```
 # 搬数据时间 = 要读写的字节数 ÷ 有效带宽
 # 计算时间   = 要做的浮点运算数 ÷ 有效算力
-# 实际耗时   ≈ max(搬数据时间, 计算时间)   ← 两者可部分重叠，先记住这个上界
+# 实际耗时   ≈ max(搬数据时间, 计算时间)
 # ```
 #
-# 谁更大，取决于"每读 1 字节能做多少次浮点运算"——这个比值叫**算术强度（AI）**：
+# 用运输来类比这两件事：
+#
+# - **GPU 是工厂**，算力是它每秒能加工多少件货（FLOPS）；
+# - **内存带宽是连接仓库和工厂的公路**，每秒能运多少字节；
+# - **token 是要加工的货物**。decode 时每个 token 单独发一车 16 GB 的货（权重），
+#   运力都花在重复运同一批货上，工厂反而吃不饱——瓶颈在公路；
+# - prefill 时 2048 个 token 拼成一车货，每件货只分摊一点点运费，工厂满负荷——瓶颈在工厂。
+#
+# 一车货值不值得运，取决于"每字节货物能加工多少次"：
+# decode 每字节只加工 1 次，运费占绝对大头；prefill 每字节能加工 2048 次，运费可忽略。
+# 这个"每字节加工次数"就是横轴——**算术强度（AI）**：
 #
 # ```
 # AI = FLOPs ÷ 字节数
-# 内存受限：耗时由搬数据决定 → 可达性能 = 带宽 × AI
-# 计算受限：耗时由算力决定   → 可达性能 = 峰值 FLOPS
+# 内存受限（公路先满）：可达性能 = 带宽 × AI
+# 计算受限（工厂先满）：可达性能 = 峰值 FLOPS
 # ```
 #
-# roofline 图就是把这两条上限画在一起，实际性能取较低的那条。横轴是 AI，纵轴是每秒浮点运算数。
+# 工厂产能和公路运力各是一条上限，实际性能取较低的那条。
+# **修路一开始收益巨大；修到工厂先到上限时，再修路也没用**——这就是 roofline 曲线"先斜后平"的由来。
 
 # %% [markdown]
 # 怎么读这张图：
 #
-# - **横轴（对数）**：每读 1 字节能做多少次浮点运算，越往右越"值钱"；
+# - **横轴（对数）**：每字节货物能加工多少次（算术强度），越往右越"值钱"；
 # - **纵轴（对数）**：每秒能完成多少浮点运算（TFLOP/s）；
-# - **红色斜线**：只被带宽限制时，性能 = `带宽 × AI`；
-# - **紫色横线**：算力上限；
+# - **红色斜线**：公路先满时，性能 = `带宽 × AI`；
+# - **紫色横线**：工厂产能上限；
 # - **曲线**：取两者较小值，所以"先斜后平"。
 #
-# 两条线的交点叫**平衡点** `AI* = 峰值 FLOPS ÷ 带宽`。
-# 在平衡点左边（AI 小）是内存受限，右边（AI 大）是计算受限。
+# 交点就是**平衡点** `AI* = 峰值 FLOPS ÷ 带宽`：左边由公路决定，右边由工厂决定。
 
 # %%
 a = torch.randn(4096, 4096, device=device)
@@ -578,7 +588,7 @@ save(fig, "ch01_time_breakdown");
 #
 # **1. batch 会把 decode 往右推。** 一次 decode B 个请求时，权重只读一遍、被 B 个 token 摊薄：
 # 字节数几乎不变，FLOPs 变成 2·P·B，AI ≈ B。B 足够大时 decode 也会变成计算受限——
-# 这就是第 05 章连续批处理提升吞吐的物理基础，也是你说的"batch 像 prefill"的准确说法。
+# 这就是第 05 章连续批处理提升吞吐的物理基础；从算术强度看，batch 后的 decode 与 prefill 属于同一类负载。
 #
 # **2. MoE 只读"被激活"的专家。** 总参数 100B 的 MoE，每个 token 可能只激活 10B：
 # 搬数据量和计算量都只按激活部分算，所以"总参数大"不等于"decode 一定卡带宽"。
@@ -592,18 +602,52 @@ save(fig, "ch01_time_breakdown");
 # %% [markdown]
 # ## 01.4 对照工业实现（vLLM）
 #
-# | 我们的概念 | vLLM 中的对应物 | 位置 |
-# | --- | --- | --- |
-# | prefill / decode 两阶段 | 由 scheduler 分别调度，V1 里是 `Prefill` / `Decode` 请求类型 | `vllm/v1/core/sched/scheduler.py` |
-# | 显存账本 | `profile_run` + `gpu_memory_utilization` 决定 KV cache 块数 | `vllm/v1/worker/gpu_worker.py` |
-# | 每步读全部权重 | `ModelRunner` 的 forward；decode 时 batch 内所有请求共享一次权重读取 | `vllm/v1/worker/gpu_model_runner.py` |
-# | 算术强度 | 决定了 chunked prefill 的收益（把 prefill 切小塞进 decode 之间的空隙） | `--enable-chunked-prefill` |
+# 前面四节用的都是"一个请求、一个模型、一次前向"。生产推理引擎要同时服务成百上千个请求，
+# 同几个概念会以更复杂的形式出现。这一节把本章的概念映射到 vLLM 的模块上，
+# 作为第 09 章读源码时的索引。**现在不要求看懂 vLLM 代码，只要求知道"我们手写的东西在工业实现里叫什么、为什么需要它"。**
 #
-# 差距在哪：
+# | 本章的概念 | 生产环境多出来的问题 | vLLM 中对应物 | 位置 |
+# | --- | --- | --- | --- |
+# | prefill / decode 两阶段 | 多个请求同时在飞，一步里该先算谁的 prefill、谁在 decode？ | Scheduler 把请求分成 Prefill / Decode 两类调度 | `vllm/v1/core/sched/scheduler.py` |
+# | 参数账本（本章 11 MiB） | 启动时先量出显存，再决定 KV cache 能开多大 | `profile_run` + `gpu_memory_utilization` | `vllm/v1/worker/gpu_worker.py` |
+# | 每步读全部权重 | batch 内所有请求共享同一次权重读取 | `ModelRunner` 的 forward | `vllm/v1/worker/gpu_model_runner.py` |
+# | 算术强度 | prefill 和 decode 的 AI 不同，混在一起调度能同时喂饱工厂和公路 | chunked prefill | `--enable-chunked-prefill` |
 #
-# - 我们的 `TinyGPT` 用 PyTorch eager 执行，每个算子一次 kernel launch；vLLM 用 **CUDA Graph** 把 decode 的固定形状调用固化，消除 launch 开销（这也是小模型在 Mac 上跑不快的原因之一）。
-# - vLLM 的 decode 会把多个请求**拼成一个 batch**，把 batch=1 时浪费的带宽重新利用起来——这正是第 05 章连续批处理要解决的问题。
-# - `gpu_memory_utilization` 的默认 0.9 不是拍脑袋：它决定了 KV cache 能开多少个块，进而决定 `max_num_seqs` 的实际上限。
+
+# %% [markdown]
+# ### 四行映射的逐条解释
+#
+# **1）为什么要由 Scheduler 分开调度 prefill / decode。**
+# 我们的代码一次只处理一个请求，调用一次 `model(ids)` 就结束；vLLM 的引擎在一个循环里，
+# 每一步从"排队中的请求"和"正在生成的请求"里挑一批，分别做 prefill 和 decode，再进入下一步。
+# 分开管理的原因是两者的资源画像相反：prefill 是算力受限（大矩阵乘），decode 是带宽受限（小矩阵乘），
+# 混在一起才能让 GPU 的算力和带宽同时被利用。
+#
+# **2）为什么启动时要先做 `profile_run`。**
+# 生产环境里权重只是显存的一部分，更大的一块是 KV cache。vLLM 启动时先加载权重、跑一次"假的最大 batch"，
+# 量出激活值的峰值显存，再用 `gpu_memory_utilization`（默认 0.9）卡住总用量，剩下的全部开成 KV cache 块。
+# 本章的"参数账本"是同一件事的玩具版：11 MiB 权重 vs 生产里 16 GB 权重 + 上百 GB KV。
+#
+# **3）为什么 batch 能省带宽。**
+# 我们的 `TinyGPT` 每次 forward 只处理一条序列，权重读一遍只用一次；vLLM 把 batch 内所有请求拼成一个
+# `ModelRunner` 前向，**一次权重读取服务 B 个 token**，算术强度从 1 涨到约 B。
+# 再加上 CUDA Graph 把 decode 的固定形状调用固化成一张图，省掉逐算子 kernel launch——
+# 这正是小模型在 Mac 上"理论 5 万 tok/s、实测几百"的原因。
+#
+# **4）为什么 `--enable-chunked-prefill` 和算术强度有关。**
+# prefill 的 AI ≈ T（算力受限），decode 的 AI ≈ 1（带宽受限）。如果严格先 prefill 再 decode，
+# 做 prefill 时带宽闲着，做 decode 时算力闲着。chunked prefill 把长 prompt 切成块，
+# 让 prefill 块和 decode 请求在同一 step 里混批，工厂和公路同时有活干——这就是第 06 章要手写的东西。
+#
+# 除了上面四条，生产引擎还有本章没有覆盖的部分，对应后面的章节：
+#
+# | 生产环境的问题 | 本课程对应章节 |
+# | --- | --- |
+# | KV cache 怎么存、怎么复用 | 第 02–04 章 |
+# | 连续批处理、抢占、chunked prefill | 第 05–06 章 |
+# | 量化、投机解码 | 第 07–08 章 |
+# | vLLM 源码结构与服务化 | 第 09–11 章 |
+# | 多卡并行、容量规划 | 第 12–14 章 |
 
 # %% [markdown]
 # ## 01.5 练习与小结

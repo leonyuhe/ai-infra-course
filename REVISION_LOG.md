@@ -22,6 +22,9 @@
 | 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 实测 2 重写：prefill 三阶段（固定开销/算力屋顶/attention 反噬），tiny vs wide 双模型对照，加入 attention 分数矩阵大小列；说明 14800 这类超长 T 无参考价值 | 本地 |
 | 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 实测 2 再次重写：补全 P/L/d/T 符号与 2P、4LdT 推导，新增 TFLOP/s(含attn) 与 attention 占比列，双面板图；澄清 max_seq_len 含义与超长 T 的问题 | 本地 |
 | 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 实测 4 重写：把 roofline 讲成“两个时间取 max”，新增 8B decode/prefill 时间分解表与柱状图、平衡点标注、batch/MoE 修正 | 本地 |
+| 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 实测 4 改成运输类比（工厂/公路/货物、修路 vs 扩产），去掉对话口吻 | 本地 |
+| 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 01.4 重写：先解释“单请求→多请求”的变化，再逐条讲 4 个 vLLM 映射，并挂到后续章节 | 本地 |
+| 2026-11-05 | `notebooks/02_kv_cache.py` | 修正一处对话口吻（“给我……你能不能”） | 本地 |
 |  |  |  |  |
 
 ## 一次性发布 checklist（全部修订完成后）
