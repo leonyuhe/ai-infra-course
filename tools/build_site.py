@@ -180,7 +180,9 @@ def build_index(chapters: list[dict], pdf_name: str | None) -> str:
         for c in chapters
     )
     pdf_btn = (
-        f'<a class="btn" href="{html.escape(pdf_name)}">下载 PDF 讲义</a>' if pdf_name else ""
+        f'<a class="btn" href="{html.escape(pdf_name)}">下载 PDF 讲义</a>'
+        if pdf_name
+        else '<a class="btn" href="https://github.com/leonyuhe/ai-infra-course/releases">PDF 讲义（Release）</a>'
     )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
