@@ -147,16 +147,21 @@ def measure_bandwidth(size_mb: int = 256, reps: int = 5) -> float:
 
 
 bw_measured = measure_bandwidth()
-bw_spec = 800.0  # M3 Ultra 官方规格：800 GB/s（其他机器请改这里）
-pd.DataFrame(
-    {
-        "指标": ["官方规格带宽", "实测 clone 带宽", "达成率"],
-        "数值": [f"{bw_spec:.0f} GB/s", f"{bw_measured:.1f} GB/s", f"{bw_measured / bw_spec:.0%}"],
-    }
-)
+# 官方带宽规格只对 GPU 有意义：M3 Ultra 800 GB/s、A100 约 2039 GB/s；CPU 没有统一规格。
+bw_spec = {"mps": 800.0, "cuda": 2039.0}.get(device.type)
+rows = [{"指标": "实测 clone 带宽", "数值": f"{bw_measured:.1f} GB/s"}]
+if bw_spec:
+    rows += [
+        {"指标": "本机官方规格", "数值": f"{bw_spec:.0f} GB/s"},
+        {"指标": "达成率", "数值": f"{bw_measured / bw_spec:.0%}"},
+    ]
+else:
+    rows += [{"指标": "官方规格", "数值": "CPU 无统一规格，只看实测"}]
+pd.DataFrame(rows)
 
 # %% [markdown]
-# 实测带宽通常是规格的 40%–70%（取决于 tensor 大小、是否命中缓存、MPS 后端效率）。
+# 在 GPU（MPS / CUDA）上，实测带宽通常是规格的 40%–70%（取决于 tensor 大小、是否命中缓存、后端效率）。
+# CPU 上带宽由内存通道和单核效率决定，绝对值会低一个数量级——所以本页在不同机器上跑出的数字不同是正常的。
 # **后面所有理论推算都用实测带宽**，不要用官网数字——这是性能估算最重要的纪律。
 
 # %% [markdown]

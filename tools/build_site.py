@@ -82,6 +82,9 @@ nav.topbar .spacer { flex: 1; }
        border-radius: 8px; font-weight: 600; margin: 8px 8px 0 0; }
 .btn:hover { text-decoration: none; opacity: .92; }
 .meta { color: var(--muted); font-size: 14px; }
+.banner { background:#FEF3C7; border:1px solid #F59E0B; color:#7C2D12; padding:10px 14px;
+          border-radius:8px; font-size:13px; line-height:1.6; margin:0 0 28px; }
+.banner a { color:#7C2D12; text-decoration:underline; }
 @media print {
   @page { size: A4; margin: 15mm 13mm; }
   @page :first { margin: 0; }
@@ -163,11 +166,17 @@ def navbar(prev_href: str | None, next_href: str | None) -> str:
     return f'<nav class="topbar"><div class="inner">{left}<span class="spacer"></span>{"".join(right)}</div></nav>'
 
 
+BANNER = (
+    '<div class="banner">⚠️ 在线阅读版由 GitHub Actions（Linux CPU）执行：'
+    '带宽、tok/s 等硬件相关数字与 Mac 本地不同，但公式与趋势一致。'
+    '本地复现见 <a href="https://github.com/leonyuhe/ai-infra-course#快速开始">README</a>。</div>'
+)
+
+
 def inject(body: str, *, nav: str, root_prefix: str) -> str:
     head_add = f'<link rel="stylesheet" href="{root_prefix}style.css">'
     body = body.replace("</head>", head_add + "\n</head>", 1)
-    body = body.replace("<body", "<body", 1)
-    body = re.sub(r"(<body[^>]*>)", r"\1\n" + nav, body, count=1)
+    body = re.sub(r"(<body[^>]*>)", r"\1\n" + nav + BANNER, body, count=1)
     return body
 
 
@@ -202,6 +211,7 @@ def build_index(chapters: list[dict], pdf_name: str | None) -> str:
 <p>每章先给直觉与图，再从零手写最小实现，然后亲手测量，最后对照 vLLM 源码。
 所有代码都在你的 Mac 上可运行。</p>
 <p><a class="btn" href="https://github.com/leonyuhe/ai-infra-course">GitHub 仓库</a>{pdf_btn}</p>
+<p class="meta">注：在线阅读版由 CI（Linux CPU）执行，硬件相关数字与 Mac 本地不同；趋势与公式一致。</p>
 <h2 style="border:0;padding-top:24px">目录</h2>
 <ul class="toc">{items}</ul>
 </div></body></html>"""
