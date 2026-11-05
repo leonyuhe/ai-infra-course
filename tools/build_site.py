@@ -10,7 +10,7 @@
 
 用法：
     python tools/build_site.py --out _site
-    python tools/build_site.py --out _site --pdf dist/ai-infra-course-v0.1.1.pdf
+    python tools/build_site.py --out _site --pdf dist/ai-infra-course-v0.2.0.pdf
     python tools/build_site.py --only 00 01 --no-execute   # 快速预览（不跑代码）
 """
 
@@ -35,7 +35,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "outputs" / ".mplcache"))
 
 TITLE = "AI Infra 从零构建"
 SUBTITLE = "从 KV cache 到 vLLM：15 章手写推理基础设施"
-VERSION = "v0.1.1"
+VERSION = "v0.2.0"
 
 CSS = """
 :root { --fg:#111827; --muted:#6B7280; --accent:#2563EB; --bg:#FFFFFF; --code:#F3F4F6; }

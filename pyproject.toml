@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiinfra-course"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI Infra 从零构建：课程共享库与 Notebook"
 requires-python = ">=3.11"
 dependencies = [
