@@ -126,7 +126,7 @@ def draw_text(base: Image.Image) -> None:
     d.text((118, 1305), "15 章手写推理基础设施", font=font(FONT_CJK, 40, 1), fill=(233, 213, 219), anchor="ls")
 
     d.text((118, 1615), "leonyuhe", font=font(FONT_GEORGIA, 54), fill=WHITE, anchor="ls")
-    d.text((118, 1669), "15 chapters · v0.1.0 · 2026", font=font(FONT_AVENIR, 28, 1), fill=(214, 190, 198), anchor="ls")
+    d.text((118, 1669), "15 chapters · v0.1.1 · 2026", font=font(FONT_AVENIR, 28, 1), fill=(214, 190, 198), anchor="ls")
 
     bx, by = 118, 1775
     for i in range(3):

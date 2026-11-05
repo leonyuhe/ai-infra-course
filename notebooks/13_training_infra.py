@@ -8,6 +8,7 @@
 # | 预计用时 | 80 分钟 |
 # | 运行环境 | ☁️ 云上 NVIDIA GPU（本地 Mac 用 TinyGPT + 线程模拟，全程可跑） |
 # | 前置章节 | 12（多卡并行） |
+# | 本章产物 | 线程 DDP 梯度同步、ZeRO 显存账本与最少卡数、LoRA 层 + 50 步训练 + merge 闭环 |
 # | 本章接口 | `aiinfra.tinygpt.TinyGPT`、`aiinfra.bench.pick_device` |
 # | 参考实现 | PyTorch DDP / FSDP、DeepSpeed ZeRO、PEFT LoRA、vLLM 0.28.x |
 #
@@ -15,14 +16,39 @@
 # 1. 15 亿参数的模型，为什么训练时每个参数要按 16 字节算？这 16 字节分别是什么？
 # 2. ZeRO-1/2/3 各切走了账本里的哪几项？同样 7B 模型，每卡显存从 112 GB 降到多少？
 # 3. LoRA 为什么能把可训练参数降到 0.5% 以下？训练完怎么合并、怎么给 vLLM 用？
-#
-# **本章的实验方式**：DDP 的梯度同步用线程模拟（4 个虚拟 rank 的数据切片 + all-reduce 平均），
-# 并与「单卡大 batch」的梯度做 all-close 断言；ZeRO 只做纯 Python 的显存账本推算；
-# LoRA 则在 TinyGPT 上真实训练 50 步、真实合并权重并验证前后输出一致。云上脚本见
-# `cloud/scripts/13_lora_finetune.sh`。
+# 4. DDP 的「梯度平均」和 LoRA 的「merge」各要用什么断言才能证明没算错？
 
 # %% [markdown]
-# ## 13.1 问题与直觉
+# ## 13.0 本章目标与路线
+#
+# **一句话目标**：把 7B 模型训练时每卡 112 GB 的「模型状态账本」拆开，用 DDP/ZeRO/LoRA 让它在
+# 80 GB（甚至 24 GB）卡上放得下、训得动，并跑通「训练 → 合并 → 部署」的闭环验证。
+#
+# **代价与边界**：
+#
+# - 本章的本地路径是**小模型 + 模拟**：DDP 用 4 个虚拟 rank 的线程 all-reduce；
+#   ZeRO 只做纯 Python 的显存账本推算；LoRA 在 TinyGPT（8.6 万参数）上真实训练 50 步。
+# - 规模换算到 7B 时，结论成立但绝对显存/速度需要上云实测（`cloud/scripts/13_lora_finetune.sh`）。
+# - TinyGPT 的 `lm_head` 与 `tok_emb` 共享权重；本实验先解绑再做 LoRA，否则 merge 会同时改
+#   输入 embedding，前后等价性不成立。
+#
+# **本章交付四样东西**：
+#
+# | # | 交付物 | 在哪一节 | 怎么验收 |
+# | --- | --- | --- | --- |
+# | 1 | 线程版 DDP 梯度 all-reduce | 13.3 Step 1 | 4 rank 平均 == 单卡大 batch（all-close） |
+# | 2 | ZeRO 三阶段显存账本 + 最少卡数 | 13.3 Step 2 | DDP=112 GB，ZeRO-3=14 GB，排序断言成立 |
+# | 3 | 从零 LoRA 层与注入 | 13.3 Step 3–4 | 只有 A/B 可训练，B=0 时等于基座 |
+# | 4 | 50 步训练 + merge 等价性 | 13.4 实验 C | loss 显著下降、基座逐位不变、merge 前后 all-close |
+#
+# **阅读路线**：13.1 问题与直觉 → 13.2 高阶设计 → 13.3 分四步实现（每步有验收）→
+# 13.4 实验 A/B/C → 13.5 对照工业实现。
+#
+# **本地模拟 vs 云上实测**：本地的 DDP 与 ZeRO 是「公式 + 线程」；云上 7B LoRA 的真实训练
+# 才会给出可对账的显存数字。13.4 会把两者的预期对齐。
+
+# %% [markdown]
+# ## 13.1 问题与直觉：推理 2 字节，训练 16 字节
 #
 # 推理时一个参数只占 2 字节（fp16），训练时却要按 16 字节准备预算：
 #
@@ -43,15 +69,74 @@
 #
 # 一个反例：7B 模型 + 8 张 A100 80GB 直接上 DDP。表上 112 GB > 80 GB，**单卡第一步就 OOM**——
 # 加卡也没用，因为 DDP 是复制模型，每张卡都要完整背 112 GB。这不是「卡不够多」，是「并行方式错了」。
+#
+# 四种方案放在同一张表里对比：
+#
+# | 方案 | 切什么 | 7B 每卡模型状态（8 卡） | 主要通信代价 | 适用场景 |
+# | --- | --- | --- | --- | --- |
+# | DDP | 不切，复制 | 112 GB | 每步梯度 all-reduce | 模型能塞进单卡，只想加吞吐 |
+# | ZeRO-1 | 只切优化器状态 | 38.5 GB | 梯度 reduce-scatter + 参数更新 | 单卡差一点放不下 |
+# | ZeRO-2 | 再切梯度 | 26.25 GB | 梯度 reduce-scatter | 显存更紧 |
+# | ZeRO-3 | 连参数也切 | 14 GB | 每层前向都要 all-gather 参数 | 显存极紧 |
+# | LoRA | 只训练低秩增量 | 14.5 GB | 同 DDP（但只同步少量梯度） | 有基座、想低成本微调 |
+#
+# **本章要解决两个子问题**：
+#
+# 1. **正确性**：多 rank 梯度平均必须等于单卡大 batch 的梯度；LoRA merge 前后输出必须一致。
+# 2. **成本**：16 字节/参数怎么被 ZeRO 逐项切走？LoRA 的可训练状态占多少？
 
 # %% [markdown]
-# ## 13.2 从零实现
+# ## 13.2 高阶设计
 #
-# ### 1) DDP：手写梯度 all-reduce，并证明它等于大 batch 梯度
+# 整章有三个组件、一条训练数据流和一张验收表。
 #
-# DDP 的数学契约很简单：N 个 rank 各算自己那份数据的梯度，然后**逐元素求平均**，
-# 结果必须等于「把 N 份数据拼成一个大 batch 算出的梯度」。我们先把这件事验证掉，
-# 因为工业实现（梯度 bucket、通信重叠、fp16 压缩）都只是在这个契约上做优化。
+# **组件 1：梯度同步（DDP 的数学契约）**
+#
+# N 个 rank 各算自己那份数据的梯度，逐元素求平均，结果必须等于「把 N 份数据拼成大 batch」的梯度。
+# 工业实现（bucket 化、通信重叠、fp16 压缩）都只是在这个契约上做优化；训练侧要保证的只有：
+# 同步后各卡梯度一致，否则权重会分叉。
+#
+# **组件 2：显存账本（ZeRO 的切分规则）**
+#
+# 每个参数的 16 字节分成三块：参数 2B、梯度 2B、优化器状态 12B（master + m + v）。ZeRO 的三阶段就是
+# 依次把「优化器状态 → 梯度 → 参数」按卡数均分；没被切的项仍然每卡一份，所以 ZeRO-1 只从
+# 112 GB 降到 38.5 GB，而不是 112/8 = 14 GB。最少卡数由「每卡预算 ÷ 剩余项」反解。
+#
+# **组件 3：LoRA 注入与合并**
+#
+# 冻结基座 W，只训练低秩增量 `ΔW = B @ A`（`A: (r,in)`、`B: (out,r)`）。前向是
+# `y = xWᵀ + (xAᵀ)Bᵀ × scaling`；B 初始化为 0，所以训练起点与基座完全一致。
+# merge 时把 `B@A×scaling` 加进 W，unmerge 时减回去——这给出可验证的等价性。
+#
+# 数据流：
+#
+# ```text
+# 训练一步：data → forward(fp16) → loss → backward(fp16) → 梯度 all-reduce(AVG) → optimizer(fp32) → 更新
+# LoRA 一步：同一流程，但只有 A/B 有梯度，基座 requires_grad=False
+# 合并：W' = W + B@A×scaling；之后前向不再走 LoRA 分支 → 应与合并前逐位一致
+# ```
+#
+# **验收标准**：
+#
+# | 步骤 | 验收 |
+# | --- | --- |
+# | Step 1 DDP 同步 | 梯度平均 vs 单卡大 batch：all-close（atol 1e-5）；不同步时 rank 间显著不同 |
+# | Step 2 ZeRO 账本 | DDP > ZeRO-1 > ZeRO-2 > ZeRO-3；ZeRO-3 == 112/8 GB |
+# | Step 3 LoRA 层 | B=0 时输出 == 基座；只有 A/B 可训练 |
+# | Step 4 注入模型 | 可训练参数占比 < 20%（TinyGPT 实测约 15%）；参数字典可显示 |
+# | 实验 A/B/C | 等价性、账本、50 步训练与 merge 全部断言通过 |
+
+# %% [markdown]
+# ## 13.3 从零实现：分四步
+#
+# 分成 4 步，每步先讲目标和做法，再给代码，最后给验收：
+#
+# | Step | 做什么 | 代码 |
+# | --- | --- | --- |
+# | 1 | 线程模拟 DDP 的梯度 all-reduce(AVG) | `threaded_allreduce_average` |
+# | 2 | 写 ZeRO 三阶段账本与最少卡数 | `zero_ledger`、`min_gpus` |
+# | 3 | 实现 LoRA 层（A/B、merge/unmerge） | `LoRALinear` |
+# | 4 | 把 LoRA 注入 TinyGPT，冻结基座 | `apply_lora` |
 
 # %%
 import sys
@@ -99,6 +184,17 @@ g_full = grads(model, ids, target)  # 单卡、大 batch 的“真值”
 model.zero_grad(set_to_none=True)
 print(f"模型参数 = {model.num_params():,}；全局 batch = {B}，切成 {N_RANK} 份")
 
+# %% [markdown]
+# ### Step 1 · DDP 的梯度 all-reduce
+#
+# **目标**：写一个线程版的梯度 all-reduce(AVG)，供实验 A 验证「多 rank 平均 == 单卡大 batch」。
+#
+# **做法**：每个 rank 的梯度字典逐 key 加进共享缓冲区，最后除以 rank 数。
+# 真实 DDP 用 ring all-reduce（第 12 章实现过），这里用共享内存 + 锁做等价模拟，
+# 重点在验证**数学契约**而不是链路。
+#
+# **验收**：两个虚拟 rank 的梯度平均等于 `(g0+g1)/2`（下面的快速自检）；完整等价性在 13.4 实验 A。
+
 # %%
 def threaded_allreduce_average(parts: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     """线程模拟 DDP 的梯度 all-reduce(AVG)：每个 rank 把梯度加进共享缓冲区，最后除以 N。"""
@@ -121,33 +217,20 @@ def threaded_allreduce_average(parts: list[dict[str, torch.Tensor]]) -> dict[str
     return {k: v / n for k, v in out.items()}
 
 
-per_rank = [grads(model, x, y) for x, y in zip(torch.chunk(ids, N_RANK), torch.chunk(target, N_RANK))]
-model.zero_grad(set_to_none=True)
-avg = threaded_allreduce_average(per_rank)
-
-err = max((avg[k] - g_full[k]).abs().max().item() for k in g_full)
-unsynced = max((per_rank[0][k] - per_rank[1][k]).abs().max().item() for k in g_full)
-assert all(torch.allclose(avg[k], g_full[k], atol=1e-5, rtol=1e-4) for k in g_full), "DDP 梯度与单卡大 batch 不一致"
-assert unsynced > 1e-3, "不同 rank 的梯度本应不同，否则数据切片没生效"
-print(f"✅ 4 个 rank 梯度平均 == 单卡大 batch 梯度，最大误差 {err:.2e}")
-print(f"   不同步时 rank0 与 rank1 的梯度最大相差 {unsynced:.3f} —— 这就是必须 all-reduce 的原因")
+_smoke = threaded_allreduce_average([{"w": torch.tensor([1.0, 3.0])}, {"w": torch.tensor([3.0, 5.0])}])
+assert torch.allclose(_smoke["w"], torch.tensor([2.0, 4.0])), "all-reduce(AVG) 的快速自检失败"
+print("✅ 快速自检：两 rank 的梯度平均 = (g0+g1)/2")
 
 # %% [markdown]
-# 真 DDP 不会「等全部算完再一次性 all-reduce」，而是把梯度按 bucket（默认 25 MB 左右）分桶，
-# 反向传播算完一个桶就立刻发一次，通信和下一个桶的计算重叠。数学不变，只是把
-# 「一次大通信」拆成「多次小通信 + 流水」。这个设计在 13.4 会对照 `torch.nn.parallel.DistributedDataParallel`。
-
-# %% [markdown]
-# ### 2) ZeRO 显存账本：16 字节怎么被切走
+# ### Step 2 · ZeRO 显存账本与最少卡数
 #
-# 先把账本写成一个函数。三阶段的区别只有一句话：
+# **目标**：把 16 字节/参数的账本写成一个函数，支持 DDP 与 ZeRO-1/2/3；再反解「给定卡型最少几张」。
 #
-# - **ZeRO-1**：只切「优化器状态」（master + m + v，共 12 B/参数）；
-# - **ZeRO-2**：ZeRO-1 + 再切梯度（2 B/参数）；
-# - **ZeRO-3**：ZeRO-2 + 连参数也切（2 B/参数）。
+# **做法**：三阶段的区别只有一句话——ZeRO-1 只切优化器状态（12B/参数），ZeRO-2 再切梯度（2B），
+# ZeRO-3 连参数也切（2B）。每项都是「总字节 ÷ N」，但没被切的项仍然每卡一份。
+# LoRA 场景下基座 14 GB 冻结，只有约 0.48% 的可训练参数产生梯度与优化器状态。
 #
-# 每一项都是「总字节 ÷ N」，但**没被切的项仍然每卡一份**，这就是为什么 DDP 的 112 GB
-# 在 ZeRO-1 下只降到 38.5 GB，而不是 112/8 = 14 GB。
+# **验收**：DDP 每卡 == 112 GB、ZeRO-3 每卡 == 14 GB（8 卡），误差 < 1e-6。
 
 # %%
 def zero_ledger(params: float, n_gpu: int, stage: int, trainable_ratio: float = 1.0) -> dict[str, float]:
@@ -178,20 +261,9 @@ def zero_ledger(params: float, n_gpu: int, stage: int, trainable_ratio: float = 
     }
 
 
-P_7B, N_GPU = 7e9, 8
-rows = []
-for name, stage in [("DDP", 0), ("ZeRO-1", 1), ("ZeRO-2", 2), ("ZeRO-3", 3)]:
-    rows.append({"方案": name, **zero_ledger(P_7B, N_GPU, stage)})
-rows.append({"方案": "LoRA(0.48%)", **zero_ledger(P_7B, N_GPU, 0, trainable_ratio=0.0048)})
-ledger_df = pd.DataFrame(rows).round(2)
-totals = dict(zip(ledger_df["方案"], ledger_df["每卡合计(GB)"]))
-assert totals["DDP"] > totals["ZeRO-1"] > totals["ZeRO-2"] > totals["ZeRO-3"] == 112 / N_GPU
-assert totals["LoRA(0.48%)"] < totals["DDP"] * 0.2
-ledger_df
-
-# %% [markdown]
-# 注意 LoRA 这一行：**基座 14 GB 冻结不动**，只有约 0.48% 的参数（3360 万）需要梯度与优化器状态，
-# 所以每卡只多 0.54 GB。下面顺手回答「7B 模型用 80 GB / 24 GB 卡最少要几张」。
+assert abs(zero_ledger(7e9, 8, 0)["每卡合计(GB)"] - 112.0) < 1e-6
+assert abs(zero_ledger(7e9, 8, 3)["每卡合计(GB)"] - 14.0) < 1e-6
+print("✅ 快速自检：DDP 112 GB / ZeRO-3 14 GB（7B，8 卡，fp16 参数 + fp32 优化器）")
 
 # %%
 def min_gpus(stage: int, params: float = 7e9, gpu_gb: float = 80.0, util: float = 0.8, trainable_ratio: float = 1.0) -> int | None:
@@ -215,31 +287,16 @@ def min_gpus(stage: int, params: float = 7e9, gpu_gb: float = 80.0, util: float 
         return None
     return int(np.ceil(sharded / (budget - fixed)))
 
-
-rows = []
-for gpu_gb in (80, 24):
-    for name, stage in [("DDP", 0), ("ZeRO-1", 1), ("ZeRO-2", 2), ("ZeRO-3", 3)]:
-        rows.append({"卡型": f"{gpu_gb} GB", "方案": name, "最少卡数（仅模型状态）": min_gpus(stage, gpu_gb=gpu_gb) or "无解"})
-    rows.append({"卡型": f"{gpu_gb} GB", "方案": "LoRA(0.48%)", "最少卡数（仅模型状态）": min_gpus(0, gpu_gb=gpu_gb, trainable_ratio=0.0048)})
-min_df = pd.DataFrame(rows)
-assert min_gpus(3, gpu_gb=24) < min_gpus(2, gpu_gb=24), "24GB 卡上 ZeRO-3 应比 ZeRO-2 省卡"
-min_df
-
 # %% [markdown]
-# ### 3) 从零实现 LoRA：A/B 两个小矩阵
+# ### Step 3 · 从零实现 LoRA 层
 #
-# LoRA 的假设是：微调带来的权重变化 `ΔW` 是低秩的。于是冻结原权重 `W`，只训练
-# `ΔW = B @ A`，其中 `A: (r, in)`、`B: (out, r)`，`r << min(in, out)`。
-# 前向变成 `y = x Wᵀ + (x Aᵀ) Bᵀ × scaling`；`B` 初始化为 0，所以训练开始时
-# `ΔW = 0`，模型行为与基座完全一致——这是 LoRA 能安全热插拔的关键。
+# **目标**：实现 `y = base(x) + (xAᵀ)Bᵀ × alpha/r`，并支持 merge/unmerge。
 #
-# 两个实现细节：
+# **做法**：A 用 kaiming 初始化、B 初始化为 0；基座参数 `requires_grad=False`；
+# merge 把 `B@A×scaling` 加进 `base.weight` 并标记 merged，之后前向只走 base，
+# 从而与「base + LoRA 分支」在数学上等价。
 #
-# - TinyGPT 的 `lm_head.weight` 与 `tok_emb.weight` 是**共享**的。如果对共享权重做 LoRA 再合并，
-#   改 lm_head 会同时改 token embedding，merge 前后输出就不等价了。所以本实验先把它解绑成
-#   两份独立权重（真实 Llama/Qwen 的输入 embedding 与输出投影本来就不共享）。
-# - 为了让随机初始化模型的 logits 量级正常（不爆成 60 的 loss），把初始参数整体乘 0.1，
-#   相当于一个「还没训练好的小模型」。
+# **验收**：B=0 时 `LoRALinear(x)` 与基座输出逐位一致（下面的断言）。
 
 # %%
 class LoRALinear(nn.Module):
@@ -273,6 +330,15 @@ class LoRALinear(nn.Module):
             self.base.weight -= (self.B @ self.A) * self.scaling
             self.merged = False
 
+
+_probe = nn.Linear(16, 8)
+_probe_lora = LoRALinear(_probe)
+_x_probe = torch.randn(4, 16)
+with torch.no_grad():
+    # B=0 时 LoRA 分支为 0，输出必须等于基座
+    assert torch.allclose(_probe_lora(_x_probe), _probe(_x_probe), atol=1e-6)
+print("✅ 快速自检：B=0 时 LoRALinear 与基座输出一致")
+
 # %%
 def apply_lora(model: nn.Module, r: int = 8, alpha: int = 16) -> int:
     """冻结全部参数，把目标 Linear 替换成 LoRALinear；返回替换个数。"""
@@ -292,6 +358,17 @@ def apply_lora(model: nn.Module, r: int = 8, alpha: int = 16) -> int:
 
     rec(model)
     return count
+
+# %% [markdown]
+# ### Step 4 · 把 LoRA 注入 TinyGPT
+#
+# **目标**：在 TinyGPT 上得到「基座冻结、只有 A/B 可训练」的模型，并统计可训练参数占比。
+#
+# **做法**：先解绑 `lm_head` 与 `tok_emb`（见 13.0 的边界说明），把初始参数整体乘 0.1 让 logits
+# 量级正常，再调 `apply_lora` 替换 QKV/proj/MLP/lm_head 的 Linear。
+#
+# **验收**：可训练参数恰好是 `2 × 替换层数` 个（A/B 各一个）；名字都以 `.A`/`.B` 结尾；
+# 其余参数全部 `requires_grad=False`。
 
 # %%
 torch.manual_seed(0)
@@ -316,7 +393,93 @@ pd.DataFrame(
 )
 
 # %% [markdown]
-# ## 13.3 实测：训练 50 步、冻结验证与 merge 等价性
+# ## 13.4 实测
+#
+# 三个实验，分别回答三个问题：
+#
+# | 实验 | 问题 | 产出 |
+# | --- | --- | --- |
+# | A | 多 rank 梯度平均真的等于单卡大 batch 吗？ | all-close 误差 + 不同步的差距 |
+# | B | 7B 模型在 DDP/ZeRO-1/2/3/LoRA 下每卡要多少显存、最少几张卡？ | 账本表 ×2 |
+# | C | 只训练 0.5% 参数能让 loss 下降吗？merge 前后输出一致吗？ | loss 表/图 + merge 误差 |
+#
+# **测量协议**：TinyGPT（8.6 万参数）/ MPS 或 CPU / torch 2.15；DDP 4 个虚拟 rank、
+# 全局 batch=8；LoRA 训练 50 步、AdamW lr=3e-2、固定随机 batch；所有断言在同一进程内完成。
+#
+# **本地模拟与云上实测的分工**：
+#
+# | 实验 | 本地模拟/小模型（本章） | 云上实测（`cloud/scripts/13_lora_finetune.sh`）的预期 |
+# | --- | --- | --- |
+# | A DDP 等价 | 线程 4 rank，误差约 1e-7 | 2 卡 DDP 对比 loss 曲线；梯度应一致 |
+# | B ZeRO 账本 | 纯公式推算 | 打印 `torch.cuda.max_memory_allocated()` 与账本对账 |
+# | C LoRA 闭环 | TinyGPT 50 步 + merge all-close | 7B LoRA：可训练 <1%、loss 下降、merge 前后 greedy 一致 |
+
+# %% [markdown]
+# ### 实验 A · 多 rank 梯度平均 == 单卡大 batch
+#
+# 把全局 batch 8 切成 4 份，每个 rank 算自己的梯度，再 all-reduce 平均；与单卡直接算的梯度
+# 逐 key 对比。同时记录「不同步时 rank0 与 rank1 的差距」，证明同步不是可选项。
+
+# %%
+per_rank = [grads(model, x, y) for x, y in zip(torch.chunk(ids, N_RANK), torch.chunk(target, N_RANK))]
+model.zero_grad(set_to_none=True)
+avg = threaded_allreduce_average(per_rank)
+
+err = max((avg[k] - g_full[k]).abs().max().item() for k in g_full)
+unsynced = max((per_rank[0][k] - per_rank[1][k]).abs().max().item() for k in g_full)
+assert all(torch.allclose(avg[k], g_full[k], atol=1e-5, rtol=1e-4) for k in g_full), "DDP 梯度与单卡大 batch 不一致"
+assert unsynced > 1e-3, "不同 rank 的梯度本应不同，否则数据切片没生效"
+print(f"✅ 4 个 rank 梯度平均 == 单卡大 batch 梯度，最大误差 {err:.2e}")
+print(f"   不同步时 rank0 与 rank1 的梯度最大相差 {unsynced:.3f} —— 这就是必须 all-reduce 的原因")
+
+# %% [markdown]
+# **读数**：平均后的最大误差约 1e-7，远小于 1e-5 阈值，说明 DDP 的数学契约成立；
+# 而不同步时两个 rank 的梯度差 0.7 量级，若直接各自更新，权重会以肉眼可见的速度分叉。
+# 真 DDP 不会「等全部算完再一次性 all-reduce」，而是把梯度按 bucket（25 MB 左右）分桶，
+# 反向传播算完一个桶就立刻发一次，通信和下一个桶的计算重叠；数学不变，只是把
+# 「一次大通信」拆成「多次小通信 + 流水」。这个设计在 13.5 会对照
+# `torch.nn.parallel.DistributedDataParallel`。
+
+# %% [markdown]
+# ### 实验 B · 7B 训练的显存账本
+#
+# 用 Step 2 的函数算 7B 模型在 8 卡下每卡的模型状态，并反解 80 GB / 24 GB 卡的最少卡数。
+# 表里只算「模型状态」，不含激活值——真实训练还要给激活留空间，所以 14 GB 不能当成「一张卡够」。
+
+# %%
+P_7B, N_GPU = 7e9, 8
+rows = []
+for name, stage in [("DDP", 0), ("ZeRO-1", 1), ("ZeRO-2", 2), ("ZeRO-3", 3)]:
+    rows.append({"方案": name, **zero_ledger(P_7B, N_GPU, stage)})
+rows.append({"方案": "LoRA(0.48%)", **zero_ledger(P_7B, N_GPU, 0, trainable_ratio=0.0048)})
+ledger_df = pd.DataFrame(rows).round(2)
+totals = dict(zip(ledger_df["方案"], ledger_df["每卡合计(GB)"]))
+assert totals["DDP"] > totals["ZeRO-1"] > totals["ZeRO-2"] > totals["ZeRO-3"] == 112 / N_GPU
+assert totals["LoRA(0.48%)"] < totals["DDP"] * 0.2
+ledger_df
+
+# %% [markdown]
+# **读数**：DDP 112 GB（放不进 80 GB 卡）→ ZeRO-1 38.5 GB → ZeRO-2 26.25 GB → ZeRO-3 14 GB。
+# LoRA 这一行是 14.5 GB：**基座 14 GB 冻结不动**，只有约 0.48% 的参数（3360 万）需要梯度与
+# 优化器状态，所以每卡只多 0.54 GB。
+
+# %%
+rows = []
+for gpu_gb in (80, 24):
+    for name, stage in [("DDP", 0), ("ZeRO-1", 1), ("ZeRO-2", 2), ("ZeRO-3", 3)]:
+        rows.append({"卡型": f"{gpu_gb} GB", "方案": name, "最少卡数（仅模型状态）": min_gpus(stage, gpu_gb=gpu_gb) or "无解"})
+    rows.append({"卡型": f"{gpu_gb} GB", "方案": "LoRA(0.48%)", "最少卡数（仅模型状态）": min_gpus(0, gpu_gb=gpu_gb, trainable_ratio=0.0048)})
+min_df = pd.DataFrame(rows)
+assert min_gpus(3, gpu_gb=24) < min_gpus(2, gpu_gb=24), "24GB 卡上 ZeRO-3 应比 ZeRO-2 省卡"
+min_df
+
+# %% [markdown]
+# **读数**：80 GB 卡上 DDP 无解，ZeRO-1 要 3 张、ZeRO-2/3 各 2 张；24 GB 卡上 ZeRO-2 要 19 张、
+# ZeRO-3 只要 6 张——这就是「ZeRO 阶段越深越省卡，但每层要 gather、通信更贵」的量化体现。
+# 加上激活值后这些数字还会变大，所以真实训练通常按 60%–70% 利用率留余量。
+
+# %% [markdown]
+# ### 实验 C · LoRA 训练 50 步 + merge 等价性
 #
 # 任务：固定 batch 的「随机 next-token 预测」——本质是让小任务过拟合，用来观察
 # 「只更新 LoRA 参数」是否真的能让 loss 下降。这不是有意义的语言建模，但足够验证闭环。
@@ -364,11 +527,9 @@ ax.legend(fontsize=8, loc="upper right")
 save(fig, "ch13_zero_and_lora");
 
 # %% [markdown]
-# 读图：左图 loss 从约 4.18（≈ ln 64，随机猜）降到 0.06，说明 LoRA 参数确实在学习；
+# **读图**：左图 loss 从约 4.18（≈ ln 64，随机猜）降到 0.06，说明 LoRA 参数确实在学习；
 # 右图 DDP 的 112 GB 超过 80 GB 红线，ZeRO-3 的 14 GB 与 LoRA 的 14.5 GB 稳稳在线下。
-# 注意右图是**模型状态**，不含激活值——真实训练还要给激活留空间，所以 14 GB 不能当成「一张卡够」。
-#
-# 接下来验证两件事：**只更新 LoRA 参数**（基座冻结），以及 **merge 前后输出一致**。
+# 注意右图是**模型状态**，不含激活值——真实训练还要给激活留空间。
 
 # %%
 for name, p in lora_model.named_parameters():
@@ -395,6 +556,9 @@ assert torch.allclose(before, restored, atol=1e-4, rtol=1e-4), "unmerge 后未�
 print(f"✅ merge 前后输出最大误差 {merge_err:.2e}；unmerge 后恢复（误差 {(before - restored).abs().max().item():.2e}）")
 
 # %% [markdown]
+# **读数**：50 步后基座逐位不变（`torch.equal`），说明梯度只流经 LoRA 的 A/B；
+# merge 前后输出误差约 1e-5，unmerge 后能恢复到同一水平——这就是「训练产物可安全合并」的证明。
+#
 # ### 实战换算：TinyGPT 的 15% vs 7B 的 0.48%
 #
 # TinyGPT 只有 8.6 万参数，LoRA rank=8 对这么小的模型来说占比很高（15%）；真实 7B 模型上
@@ -414,7 +578,7 @@ assert lora_state_gb / lora_full_state_gb < 0.02
 ratio_df
 
 # %% [markdown]
-# ## 13.4 对照工业实现
+# ## 13.5 对照工业实现
 #
 # | 我们的实现 | 工业实现中的对应物 | 文件/参数 |
 # | --- | --- | --- |
@@ -440,11 +604,11 @@ ratio_df
 # 1) 训练：LoRA 适配器保存为 adapter_model.safetensors（只有 A/B，几十 MB）
 # 2) 路线 A（合并）：merge 进基座 → 导出完整 fp16 模型 → vLLM 直接加载（无额外开销）
 # 3) 路线 B（热插拔）：基座 + adapter 分别加载 → vLLM --enable-lora，多租户共享基座
-# 4) 验收：同一批 prompt，merge 前后 / 启用 adapter 前后的输出做 all-close（13.3 的做法）
+# 4) 验收：同一批 prompt，merge 前后 / 启用 adapter 前后的输出做 all-close（13.4 实验 C 的做法）
 # ```
 
 # %% [markdown]
-# ## 13.5 练习与小结
+# ## 13.6 练习与小结
 #
 # **练习**
 #

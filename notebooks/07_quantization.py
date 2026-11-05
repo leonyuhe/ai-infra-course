@@ -1,55 +1,160 @@
 # %% [markdown]
 # # 第 07 章 · 量化：把权重压小，把带宽省下来
 #
-# > decode 每生成一个 token 都要把全部权重读一遍（第 01 章）。权重小一半，理论上 token 就快一倍。
-# > 这一章我们从零手写对称量化，量 TinyGPT 的真实权重，算出 7B/8B 的显存与 tok/s 账本。
+# > decode 每生成一个 token 都要把全部权重读一遍（01 章）。这一章把权重从 fp16 压到 int8/int4，
+# > 用「字节减半 → token 翻倍」的账本解释收益，再用 TinyGPT 的真实权重把误差量出来。
 #
 # | 项目 | 内容 |
 # | --- | --- |
-# | 预计用时 | 75 分钟 |
-# | 运行环境 | 🏠 Mac（CPU/MPS）· 无需 GPU |
-# | 前置章节 | 01（roofline 与 decode 带宽公式） |
-# | 本章接口 | `aiinfra.tinygpt.TinyGPT` 的 qkv / mlp 权重；`aiinfra.bench` 的带宽与 decode 公式 |
+# | 预计用时 | 90 分钟 |
+# | 运行环境 | 🏠 Mac（MPS / CPU）· 无需 GPU · torch 2.15 |
+# | 前置章节 | 01（decode 带宽、roofline、算术强度） |
+# | 本章产物 | 对称量化器（tensor / channel / group）、误差指标与字节账本、TinyGPT 权重实验、7B/8B decode 账本 |
+# | 本章接口 | `absmax_scale / quantize / dequantize / quant_error / quant_bytes`（本章内联，08 章不依赖） |
 # | 对照版本 | vLLM 0.28.x |
 #
 # **学完你能回答：**
 # 1. 对称量化的一行公式是什么？误差由哪三件事决定？
 # 2. per-tensor / per-channel / per-group 差多少？为什么工业界默认 `group_size=128`？
-# 3. 7B/8B 模型在 fp16/int8/int4 下的权重显存、decode 理论 tok/s 各是多少？为什么量化主要收益在 decode？
+# 3. 7B/8B 在 fp16/int8/int4 下的权重显存、decode 理论 tok/s 各是多少？为什么量化主要收益在 decode？
+# 4. vLLM 的 `--quantization` / `--kv-cache-dtype fp8` 分别对应本章哪个概念？
 
 # %% [markdown]
-# ## 07.1 问题与直觉
+# ## 07.0 本章目标与路线
 #
-# 量化就是**用更少的比特表示同一组浮点数**。对称量化的公式只有一行：
+# **一句话目标**：把线性层权重的存储从 fp16 换成 int8 / int4，让 decode 每生成一个 token
+# 少读一半到 3/4 的字节，同时把量化误差控制在不破坏输出的范围内。
 #
-# ```text
-# x_q = clamp(round(x / s), -qmax, qmax)，  qmax = 2^(b-1) - 1，  x̂ = s · x_q，  s = absmax / qmax
-# ```
+# **代价 / 边界**：
 #
-# `s` 是**步长**（相邻两个格点的距离），b 个比特最多表示 `2^b` 个格点。量化的全部误差来自三件事：
+# - **精度**：int4 的步长是 int8 的 16 倍，per-tensor 时权重误差可达几十个百分点，必须靠分组和离群值处理；
+# - **kernel**：量化省的是带宽不是算力。没有融合的 int4 GEMM（Marlin 一类）时，反量化 + 普通 matmul 只会更慢；
+# - **收益场景**：只在 decode（batch=1、带宽受限）明显；prefill 是 compute-bound，量化收益有限，甚至可能变慢。
+#
+# **本章交付四样东西**：
+#
+# | # | 交付物 | 在哪一节 | 怎么验收 |
+# | --- | --- | --- | --- |
+# | 1 | 对称量化器：per-tensor / per-channel / per-group | 07.3 Step 1 | int4 落在 `[-7,7]`；反量化误差 ≤ s/2 |
+# | 2 | 误差指标 + 存储字节账本 | 07.3 Step 2 | 舍入上界成立；group-32 优于 per-tensor |
+# | 3 | 量化 TinyGPT 的 qkv / mlp 权重并对比 logits | 07.3 Step 3 | int8 logits 相对误差 < 1% |
+# | 4 | 三组实测：粒度、离群值、显存与带宽账本 | 07.4 实验 A/B/C | 趋势与公式一致，账本可手算 |
+#
+# **阅读路线**：07.1 现象 → 07.2 高阶设计 → 07.3 三步实现（每步有验收）→ 07.4 实验 → 07.5 对照 vLLM。
+
+# %% [markdown]
+# ## 07.1 问题与直觉：decode 的瓶颈是「读权重」
+#
+# 01 章的账本：decode 每生成 1 个 token，都要把全部权重从显存读一遍，算术强度 ≈ 1 FLOP/byte，
+# 所以吞吐上限就是 `带宽 ÷ 每 token 字节数`。以 8B 模型、M3 Ultra 实测带宽 ~500 GB/s 为例：
+#
+# | 精度 | 每参数字节 | 8B 权重 | decode 理论 tok/s |
+# | --- | --- | --- | --- |
+# | fp16 | 2 | 16 GB | ~31 |
+# | int8 | 1 | 8 GB | ~62 |
+# | int4 | 0.5 | 4 GB | ~125 |
+#
+# **结论**：精度每降一档，每 token 读取的字节减半，decode 上限就翻倍。这就是量化最直接的收益。
+#
+# 但量化不是免费的：把权重从连续浮点映射到有限格点必然产生误差，
+# 而误差的大小取决于**粒度**和**离群值**。下图是本章的核心矛盾：
 #
 # ![](../assets/figures/ch07_quant_error.svg)
 #
-# 1. **舍入误差**：每个值最多偏离 `s/2`，这是不可避免的底噪；
-# 2. **范围误差**：`absmax` 被一个离群值撑大，步长 `s` 跟着变大，所有正常值的噪声被同步放大；
-# 3. **粒度**：per-tensor 全场共用一个 `s`；per-channel 每行一个；per-group 每 `g` 个元素一个。
-#    越细，离群值越难污染别人，但额外存的 scale 也越多。
-#
-# **反例**：对真实 LLM 权重直接做 per-tensor int4，一个 20 倍离群值就能把步长撑大十几倍，
-# 相对误差从 ~2% 掉到 >20%，输出分布直接崩（07.3 会在 TinyGPT 上把这个数字量出来）。
-# 所以 AWQ / GPTQ 这些工业实现默认 `group_size=128`，而不是"一把梭 per-tensor"。
-#
-# 最后两个必须分清的概念：**对称量化**令零点 `z=0`，反量化只乘一次 scale，kernel 最简单；
-# **非对称量化**多存一个 zero-point `z`，适合 ReLU 之后的偏斜分布。但 int4 的 `[-8,7]` 天生不对称，
-# 工业实现通常仍走「对称 + group」的折中，本章主线也保持对称。
+# **反例**：对真实 LLM 权重直接做 per-tensor int4，一个 20 倍离群值就能把步长撑大十几倍；
+# 07.4 实验 B 会在 TinyGPT 上量出「logits 相对误差从 ~2% 涨到 ~20%」的过程。
+# AWQ / GPTQ 这些工业实现默认 `group_size=128`，就是为了避免这种情况。
 
 # %% [markdown]
-# ## 07.2 从零实现
+# 把两种精度的差异摊开看：
 #
-# ### 1) 接口：scale → 整数 → 反量化
+# | | fp16（基线） | int8 | int4 |
+# | --- | --- | --- | --- |
+# | 每参数存储 | 2 B | 1 B | 0.5 B（实际还要存 scale） |
+# | 反量化 | 不需要 | `q × s` | `q × s`，且必须分组 |
+# | 主要误差来源 | 无 | 舍入噪声（很小） | 舍入 + 离群值污染 |
+# | kernel | 普通 GEMM | int8 GEMM 或 W8A16 | W4A16 + Marlin 一类融合 kernel |
+# | 典型用途 | 精度基线 | 显存换倍、几乎无损 | 极致省带宽、需要分组/校准 |
 #
-# 先把契约钉死：`absmax_scale` 只负责算步长，`quantize` 返回整数值张量（int4 也先寄存在 `int8` 里，
-# 真实存储时两个 int4 挤进一个字节），`dequantize` 乘回 scale。这样换粒度只改一个参数。
+# 本章要解决两个**互相牵制**的子问题：
+#
+# 1. **正确性（精度）**：量化后的输出还能不能用？用什么指标衡量、怎么让它可控？
+# 2. **成本（收益）**：量化到底省了多少字节、decode 理论 tok/s 提升多少？为什么在 Mac 上测不出来？
+
+# %% [markdown]
+# ## 07.2 高阶设计
+#
+# 动手前先把方案定下来。整章只有三个组件和一条数据流。
+#
+# **组件 1：量化 / 反量化（存什么）**
+# 每个权重张量存两样东西：整数张量 `q` 和缩放因子 `scale`。
+# `scale` 的粒度决定误差：per-tensor 全场一个；per-channel 每行一个；per-group 每 `g` 个元素一个。
+# 反量化就是 `x̂ = q × scale`——这是 W4A16 的思路：权重存整数，计算时再变回浮点。
+# 另一种选择是**非对称量化**（多存一个 zero-point，适合 ReLU 之后的偏斜分布）；
+# 本章主线保持对称，练习 3 会实现非对称版本并给出误差对比。
+#
+# **组件 2：离群值与分组（误差从哪来）**
+# 对称量化的步长 `s = absmax / qmax`，由**绝对值最大的元素**决定。
+# 一个离群值就会把全场步长撑大，让所有正常值一起变粗。
+# 分组的作用就是把 `absmax` 限制在小范围内，不让一个离群值污染整层。
+#
+# **组件 3：误差度量与字节账本（怎么验收）**
+# 权重误差用 `‖x−x̂‖/‖x‖`（跨层可比），存储用 `权重比特数 + scale 字节`，
+# 收益用 `字节 ÷ 带宽` 换算成 decode tok/s。三者必须能互相印证。
+#
+# 数据流：
+#
+# ```text
+# fp32 权重 → absmax 求 scale → q = round(x/s) 截断 → 存 q + scale
+#                                                    ↓ 推理时
+#                                     x̂ = q × scale → matmul / 融合 kernel
+# ```
+
+# %% [markdown]
+# ### 接口契约
+#
+# 后面的实现、07.4 的实验、以及练习共用同一组函数签名；换粒度只改一个参数：
+#
+# | 函数 / 参数 | 语义 |
+# | --- | --- |
+# | `absmax_scale(x, bits, granularity, group_size)` | 求步长 `s` 与 `qmax`，不修改权重 |
+# | `quantize(x, bits, granularity, group_size)` | 返回 `(q, scale)`，`q` 用 int8 承载（int4 也暂存 int8） |
+# | `dequantize(q, scale)` | 反量化回浮点：`q × scale` |
+# | `quant_error(x, x_hat)` | 返回 MSE、最大绝对误差、相对误差 |
+# | `quant_bytes(shape, bits, granularity, group_size)` | 权重 + scale 的真实存储字节（scale 按 fp16 算） |
+#
+# 为什么 int4 也用 int8 承载？PyTorch 没有 int4 张量类型；教学上先存 int8、值域限制在 `[-7,7]`，
+# 真实实现会把两个 int4 打进一个字节，本章的字节账本用 `bits/8` 折算。
+#
+# ### 验收标准
+#
+# 每个实现步骤都配一条可执行的验收，写不出来就说明没理解：
+#
+# | 步骤 | 验收 |
+# | --- | --- |
+# | Step 1 量化器 | int4 值域 `[-7,7]`；任何值反量化误差 ≤ `s/2` |
+# | Step 2 度量与账本 | `quant_bytes` 与手算一致；同一权重 group-32 误差 < per-tensor |
+# | Step 3 接进模型 | qkv+mlp int8 的 logits 相对误差 < 1%，int4 < 5% |
+# | 实验 A/B/C | 误差随粒度单调下降；账本比例严格 2×/4× |
+
+# %% [markdown]
+# ## 07.3 从零实现：分三步
+#
+# | Step | 做什么 | 代码 |
+# | --- | --- | --- |
+# | 1 | 对称量化三函数：scale → 整数 → 反量化 | `absmax_scale` / `quantize` / `dequantize` |
+# | 2 | 误差指标与存储字节：把「精度代价」量化 | `quant_error` / `quant_bytes` |
+# | 3 | 把反量化接进 TinyGPT 的 qkv / mlp 权重 | `quantized_copy` |
+#
+# 每一步末尾都有 `assert` 验收；三步全部通过，再进入 07.4 的实验。
+#
+# ### Step 1 · 对称量化三函数
+#
+# **目标**：给定任意二维权重，按指定粒度算出步长，量化成整数，再反量化回来。
+#
+# **做法**：`absmax_scale` 只负责求 `s`：per-tensor 取全场最大值；per-channel 沿输出维求；
+# per-group 先把最后一维切段再求。`qmax = 2^(b-1)-1`，`q = clamp(round(x/s), -qmax, qmax)`。
+# 对称量化令零点 = 0，所以反量化只有一次乘法；int4 的 `[-8,7]` 天生不对称，这里对称地截在 `[-7,7]`。
 
 # %%
 import sys
@@ -73,12 +178,6 @@ torch.manual_seed(0)
 np.random.seed(0)
 
 print("device =", device)
-
-# %% [markdown]
-# ### 2) 三个核心函数
-#
-# `absmax` 的求法决定了粒度：`tensor` 是全场一个标量；`channel` 沿输出维求（每行一个 scale）；
-# `group` 先把最后一维切成 `in_features / group_size` 段，每段一个 scale。断言写在函数里，违反契约立刻报错。
 
 # %%
 def absmax_scale(x: torch.Tensor, bits: int, granularity: str = "tensor", group_size: int | None = None):
@@ -110,9 +209,25 @@ def dequantize(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return q.to(torch.float32) * scale
 
 # %% [markdown]
-# ### 3) 误差指标与存储字节
+# **验收**：int4 的值域必须落在 `[-7,7]`；对任意值，反量化误差不超过半个步长 `s/2`。
+
+# %%
+torch.manual_seed(0)
+w_demo = torch.randn(64, 256) * 0.03
+w_demo[:, 0] *= 30.0                                   # 单通道离群值：真实权重里存在
+q8, s8 = quantize(w_demo, 8, "tensor")
+q4, s4 = quantize(w_demo, 4, "tensor")
+assert q8.dtype == torch.int8 and q8.shape == w_demo.shape
+assert int(q4.max()) <= 7 and int(q4.min()) >= -7       # 对称 int4 只用 [-7, 7]，不碰 -8
+assert (w_demo - dequantize(q8, s8)).abs().max() <= float(s8) / 2 + 1e-6
+print(f"int8 最大误差 { (w_demo - dequantize(q8, s8)).abs().max():.5f} ≤ s/2 = {float(s8) / 2:.5f} ✓")
+
+# %% [markdown]
+# ### Step 2 · 误差指标与存储字节
 #
-# 三个误差指标各有用途：MSE 看整体噪声，最大绝对误差看最坏元素，
+# **目标**：把「量化代价」变成可比较的数字，并把 scale 的开销也算进存储账本。
+#
+# **做法**：三个误差指标各有用途——MSE 看整体噪声，最大绝对误差看最坏元素，
 # **相对误差** `‖x−x̂‖/‖x‖` 最适合跨层、跨模型比较。存储字节必须把 scale 算进去：
 # group 越细，权重越小但 scale 越多，存在一个最优点。
 
@@ -137,31 +252,100 @@ def quant_bytes(shape: tuple, bits: int, granularity: str = "tensor", group_size
         n_scales = shape[0] * (shape[1] // group_size)
     return n * bits / 8 + n_scales * 2
 
+# %% [markdown]
+# **验收**：`quant_bytes` 与手算一致；同时把 demo 权重的两种粒度误差摊开，
+# 确认「分组更细 → 误差更小」这条不变量在这份权重上成立。
 
+# %%
+pd.DataFrame([{"位宽": 8, **quant_error(w_demo, dequantize(q8, s8))},
+              {"位宽": 4, **quant_error(w_demo, dequantize(q4, s4))}]).round(5)
+
+# %%
+assert quant_bytes((768, 256), 8, "tensor") == 768 * 256 + 2
+assert quant_bytes((768, 256), 4, "channel") == 768 * 256 * 4 / 8 + 768 * 2
+assert quant_bytes((768, 256), 4, "group", 32) == 768 * 256 * 4 / 8 + 768 * 8 * 2
+err_group = quant_error(w_demo, dequantize(*quantize(w_demo, 8, "group", 32)))["相对误差"]
+err_tensor = quant_error(w_demo, dequantize(*quantize(w_demo, 8, "tensor")))["相对误差"]
+assert err_group < err_tensor, "分组量化的误差应小于 per-tensor"
+print(f"group-32 = {err_group:.4f} < per-tensor = {err_tensor:.4f} ✓")
+
+# %% [markdown]
+# ### Step 3 · 把反量化接进 TinyGPT
+#
+# **目标**：在真实模型上验证「量化权重 → 输出偏差可控」，而不是只看权重误差。
+#
+# **做法**：复制一份 TinyGPT，把名字里含 `qkv` 或 `mlp` 的二维权重换成反量化后的值，
+# 其余部分（embedding、norm、lm_head、注意力输出投影）保持 fp32——这就是 W4A16 的模拟：
+# 权重是整数，激活和计算仍是浮点。用同一批输入比较 logits。
+
+# %%
 torch.manual_seed(0)
-w = torch.randn(64, 256) * 0.03
-w[:, 0] *= 30.0                                   # 单通道离群值：真实权重里存在
-q8, s8 = quantize(w, 8, "tensor")
-q4, s4 = quantize(w, 4, "tensor")
-assert q8.dtype == torch.int8 and q8.shape == w.shape
-assert int(q4.max()) <= 7 and int(q4.min()) >= -7  # 对称 int4 只用 [-7, 7]，不碰 -8
-assert quant_error(w, dequantize(q8, s8))["最大绝对误差"] <= float(s8) / 2 + 1e-6
-assert quant_error(w, dequantize(*quantize(w, 8, "group", 32)))["相对误差"] < \
-       quant_error(w, dequantize(*quantize(w, 8, "tensor")))["相对误差"]
-pd.DataFrame([{"位宽": 8, **quant_error(w, dequantize(q8, s8))},
-              {"位宽": 4, **quant_error(w, dequantize(q4, s4))}])
+model = TinyGPT(GPTConfig()).to(device).eval()
+torch.manual_seed(3)
+prompt = torch.randint(0, model.cfg.vocab_size, (4, 64), device=device)
+with torch.no_grad():
+    ref_logits = model(prompt)
+
+
+def quantized_copy(base: TinyGPT, bits: int, granularity: str, group_size=None,
+                   scope: tuple = ("qkv", "mlp")) -> TinyGPT:
+    """复制一份模型，把名字里含 scope 关键字的二维权重换成反量化值（模拟 W8/W4A16）。"""
+    mq = TinyGPT(GPTConfig()).to(device).eval()
+    mq.load_state_dict(base.state_dict())
+    with torch.no_grad():
+        for name, p in mq.named_parameters():
+            if p.dim() != 2 or "lm_head" in name:
+                continue
+            if not any(tag in name for tag in scope):
+                continue
+            p.copy_(dequantize(*quantize(p.data.clone(), bits, granularity, group_size)))
+    return mq
 
 # %% [markdown]
-# 断言全部通过说明：舍入误差不超过 `s/2`（这是量化理论上界）、int4 被正确截断在 `[-7,7]`、
-# 而 group 粒度在同一份权重上确实优于 per-tensor。下面开始跑真实实验。
+# **验收**：按量化范围（仅 qkv / 仅 mlp / 全部）与位宽列表，int8 的 logits 相对误差应远小于 1%，
+# int4 应小于 5%；同时记录 top-1 一致率（注意它在这里没有区分度，原因接下来说明）。
+
+# %%
+rows = []
+for scope_name, scope in [("仅 qkv", ("qkv",)), ("仅 mlp", ("mlp",)), ("qkv + mlp", ("qkv", "mlp"))]:
+    for bits in (8, 4):
+        with torch.no_grad():
+            out = quantized_copy(model, bits, "group", 32, scope=scope)(prompt)
+        rows.append({"量化范围": scope_name, "位宽": bits,
+                     "logits 相对误差": round(((out - ref_logits).norm() / ref_logits.norm()).item(), 5),
+                     "top-1 一致率": round((out.argmax(-1) == ref_logits.argmax(-1)).float().mean().item(), 3)})
+scope_df = pd.DataFrame(rows)
+assert scope_df[scope_df["位宽"] == 8]["logits 相对误差"].max() < 0.01
+assert scope_df[scope_df["位宽"] == 4]["logits 相对误差"].max() < 0.05
+scope_df
 
 # %% [markdown]
-# ## 07.3 实测
+# 两个发现：**mlp 比 qkv 更敏感**（同样 int4，mlp 单独量化后的 logits 误差更大，因为参数量占 2/3），
+# 并且 **top-1 一致率全是 1.0**——这个指标在这里没有区分度。随机权重模型的 logits 由单一 token 主导，
+# argmax 极其稳定；真实模型要看 perplexity / KL / 任务指标，不能只看 top-1。
 #
-# ### 实测 1：粒度对误差的影响（合成权重，固定 seed）
+# 到这里，量化器的正确性验收完成。下面是三组实测：粒度、离群值、显存与带宽。
+
+# %% [markdown]
+# ## 07.4 实测
 #
-# 真实 LLM 权重近似高斯，但每个模型都有少量**离群值**。先造一个带离群值的权重，
-# 把 per-tensor / per-channel / per-group 的误差摊开看：这部分是我们可以控制的。
+# 三组实验，分别回答三个问题：
+#
+# | 实验 | 问题 | 产出 |
+# | --- | --- | --- |
+# | A | 粒度对权重误差的影响有多大？ | 误差/字节表 + 粒度曲线 |
+# | B | 真实权重 + 离群值下，logits 偏差多大？ | 模型级误差表 + 位宽曲线 |
+# | C | 7B/8B 的显存与 decode tok/s 账本是多少？ | 精度账本、KV 账本、图 |
+#
+# 测量协议：M3 Ultra / 96GB / torch 2.15 / MPS；量化误差是确定性计算（固定 seed，与机器无关），
+# 带宽与延迟用 `warmup=2–3, reps=5–9` 取中位数。绝对值随机器变化，**趋势才是结论**。
+#
+# ### 实验 A · 粒度对权重误差的影响
+#
+# **问题**：per-tensor / per-channel / per-group 的权重误差差多少？scale 开销多大？
+#
+# **协议**：造一个 768×256 的合成权重（近似高斯），注入一个 20 倍单通道离群值和几个孤立元素离群值，
+# 固定 seed，扫 5 种粒度 × 2 种位宽，报相对误差与每行字节。
 
 # %%
 torch.manual_seed(0)
@@ -184,7 +368,7 @@ weight_df = pd.DataFrame(rows)
 weight_df
 
 # %% [markdown]
-# 读表：per-tensor int8 的相对误差是 9.7%，而 group-32 只有 1.1%——差约 9 倍。
+# **读数**：per-tensor int8 的相对误差是 9.7%，而 group-32 只有 1.1%——差约 9 倍。
 # int4 更夸张：per-tensor 53.5% 已经接近"把权重随机化"，group-32 才 13.6%。
 # 注意**每行字节**：group-32 的 scale 开销比 per-channel 多 5%–11%（位宽越低越明显），这是精度的代价。
 #
@@ -210,67 +394,21 @@ ax.legend(fontsize=9)
 save(fig, "ch07_quant_error_curve")
 
 # %% [markdown]
-# 读图：**现象**是两条线都随分组变细而下降，但 int4 的下降斜率远大于 int8；
-# **原因**是 `s ∝ absmax / 2^b`，离群值固定时 int4 的绝对步长是 int8 的 16 倍，
-# 一次舍入就能吃掉大量有效位；分组把 absmax 限定在小范围内，才把步长压回来。
+# **读图**：两条线都随分组变细而下降，但 int4 的绝对误差始终比 int8 高一个数量级（5–13 倍），
+# 所以 int4 更依赖分组。原因是 `s ∝ absmax / 2^b`：离群值固定时 int4 的步长是 int8 的 16 倍，
+# 一次舍入就能吃掉大量有效位；分组把 `absmax` 限定在小范围内，才把步长压回来。
 # **对 vLLM 参数的启示**：`--quantization gptq/awq` 的 `group_size` 默认 128 不是随便定的——
-# 它刚好让 int4 的误差落回可接受区，同时 scale 开销只有 ~3%。
+# 它让 int4 的误差落回可接受区，同时 scale 开销只有 ~3%。
 #
-# ### 实测 2：量化 TinyGPT 的真实 qkv / mlp 权重，看 logits 偏差
+# ### 实验 B · 离群值下，logits 偏差有多大
 #
-# 权重误差只是中间量，用户关心的是**输出变了多少**。我们把 TinyGPT 的 qkv、mlp 权重换成反量化后的值，
-# 用同一批输入比较 logits。随机初始化的权重近似高斯，所以这里 per-tensor 也"够用"——
-# 正好可以拿来和后面注入离群值的版本对照。
+# **问题**：权重误差只是中间量，用户关心的是**输出变了多少**。注入一个 20 倍的通道离群值后，
+# 不同粒度/位宽的 logits 偏差分别是多少？
+#
+# **协议**：在 TinyGPT 的 qkv 权重里把第 5 个输入通道放大 20 倍（模拟 AWQ/SmoothQuant 论文里的
+# outlier channel），以这个注入后的 fp32 模型为参考，量化 qkv+mlp 后比较 logits。
 
 # %%
-torch.manual_seed(0)
-model = TinyGPT(GPTConfig()).to(device).eval()
-torch.manual_seed(3)
-prompt = torch.randint(0, model.cfg.vocab_size, (4, 64), device=device)
-with torch.no_grad():
-    ref_logits = model(prompt)
-
-
-def quantized_copy(base: TinyGPT, bits: int, granularity: str, group_size=None,
-                   scope: tuple = ("qkv", "mlp")) -> TinyGPT:
-    """复制一份模型，把名字里含 scope 关键字的二维权重换成反量化值（模拟 W8/W4A16）。"""
-    mq = TinyGPT(GPTConfig()).to(device).eval()
-    mq.load_state_dict(base.state_dict())
-    with torch.no_grad():
-        for name, p in mq.named_parameters():
-            if p.dim() != 2 or "lm_head" in name:
-                continue
-            if not any(tag in name for tag in scope):
-                continue
-            p.copy_(dequantize(*quantize(p.data.clone(), bits, granularity, group_size)))
-    return mq
-
-
-rows = []
-for scope_name, scope in [("仅 qkv", ("qkv",)), ("仅 mlp", ("mlp",)), ("qkv + mlp", ("qkv", "mlp"))]:
-    for bits in (8, 4):
-        with torch.no_grad():
-            out = quantized_copy(model, bits, "group", 32, scope=scope)(prompt)
-        rows.append({"量化范围": scope_name, "位宽": bits,
-                     "logits 相对误差": round(((out - ref_logits).norm() / ref_logits.norm()).item(), 5),
-                     "top-1 一致率": round((out.argmax(-1) == ref_logits.argmax(-1)).float().mean().item(), 3)})
-scope_df = pd.DataFrame(rows)
-scope_df
-
-# %% [markdown]
-# 两个发现：**mlp 比 qkv 更敏感**（同样 int4，mlp 单独量化后的 logits 误差更大，因为参数量占 2/3），
-# 并且 **top-1 一致率全是 1.0**——别被这个指标骗了。随机权重模型的 logits 由单一 token 主导，
-# argmax 极其稳定；真实模型要看 perplexity / KL / 任务指标，不能只看 top-1。
-#
-# 现在把真实权重里的"离群值"注入进去：模拟某些输入通道大 20 倍的情况，再量化：
-
-# %%
-torch.manual_seed(0)
-base = TinyGPT(GPTConfig()).to(device).eval()
-torch.manual_seed(3)
-prompt = torch.randint(0, base.cfg.vocab_size, (4, 64), device=device)
-
-
 def with_outlier(model_: TinyGPT, col: int = 5, scale: float = 20.0) -> TinyGPT:
     """把 qkv 的某一列（一个输入通道）放大 scale 倍——AWQ/SmoothQuant 论文里的 outlier channel。"""
     m = TinyGPT(GPTConfig()).to(device).eval()
@@ -282,7 +420,7 @@ def with_outlier(model_: TinyGPT, col: int = 5, scale: float = 20.0) -> TinyGPT:
     return m
 
 
-outlier_model = with_outlier(base)
+outlier_model = with_outlier(model)
 with torch.no_grad():
     ref_outlier = outlier_model(prompt)
 
@@ -300,8 +438,8 @@ outlier_df = pd.DataFrame(rows)
 outlier_df
 
 # %% [markdown]
-# 这张表就是本章最重要的数字：**注入一个 20 倍通道离群值之后**，int4 per-tensor 的 logits 相对误差
-# 从 2.0% 涨到 20.8%，per-channel 也救不了（16.5%）——因为离群值在列上，每一行都躲不开；
+# **读数**：注入一个 20 倍通道离群值之后，int4 per-tensor 的 logits 相对误差从 2.0% 涨到 20.8%，
+# per-channel 也救不了（16.5%）——因为离群值在列上，每一行都躲不开；
 # 只有 group-32 把它限制在 1/32 的列里，误差回到 6.4%。这就是 GPTQ / AWQ 必须分组量化的原因。
 # 下面把"位宽"这条轴单独画出来：
 
@@ -332,15 +470,16 @@ ax.legend()
 save(fig, "ch07_bits_vs_error")
 
 # %% [markdown]
-# 读图：int8 三条线挤在 0.4%–1.8% 之间，说明**位宽够用时粒度只是优化项**；
+# **读图**：int8 三条线挤在 0.4%–1.8% 之间，说明**位宽够用时粒度只是优化项**；
 # int4 per-tensor 是 20.8%，比 int8 per-tensor 大一个数量级，group-32 才把它拉回 6.4%。
 # 一句话：**int8 可以粗，int4 必须细。**
-
-# %% [markdown]
-# ### 实测 3：7B/8B 的显存与 decode 理论 tok/s 账本
 #
-# 先测这台机器实际能达到的带宽（第 01 章的 `clone` 法：读 N 字节 + 写 N 字节），
-# 再用第 01 章的公式 `decode tok/s = 带宽 ÷ 每 token 读取字节` 推账本。
+# ### 实验 C · 7B/8B 的显存与 decode 理论 tok/s 账本
+#
+# **问题**：7B/8B 在三种精度下的权重显存、decode 上限各是多少？长上下文时 KV cache 会怎么改变结论？
+#
+# **协议**：先用 `clone()` 测本机有效带宽（第 01 章的方法：读 N 字节 + 写 N 字节），
+# 再用 `decode tok/s = 带宽 ÷ 每 token 读取字节` 推账本；假设 batch=1、带宽利用率 100%。
 
 # %%
 def measure_bandwidth(size_mb: int = 256, reps: int = 5) -> float:
@@ -375,9 +514,10 @@ ledger_df = pd.DataFrame(rows)
 ledger_df
 
 # %% [markdown]
-# 读表（带宽随机器与当次实测浮动，绝对值以表格为准）：7B fp16 权重 13GiB，int8 减半到 6.5GiB，
-# int4 只剩 3.3GiB——**精度每降一档，每 token 读取字节减半，理论 tok/s 就翻一倍**（表里"相对 fp16 加速"列恒为 2.0/4.0）。
-# **注意前提**：这些数字假设 batch=1、权重带宽利用率 100%，实际还要扣掉 KV cache、kernel 效率、
+# **读数**（带宽随机器与当次实测浮动，绝对值以表格为准）：7B fp16 权重 13GiB，int8 减半到 6.5GiB，
+# int4 只剩 3.3GiB——精度每降一档，每 token 读取字节减半，理论 tok/s 就翻一倍
+# （表里"相对 fp16 加速"列恒为 2.0/4.0）。
+# **注意前提**：这些数字假设 batch=1、带宽利用率 100%，实际还要扣掉 KV cache、kernel 效率、
 # 采样开销（第 01 章实测 TinyGPT 只跑到理论值的 0.5%）。真实 7B/8B 在 M3 Ultra 上的 decode
 # 通常在 20–60 tok/s 量级，但**相对关系**（int8≈2×、int4≈4×）成立。
 #
@@ -397,11 +537,11 @@ kv_df = pd.DataFrame(rows)
 kv_df
 
 # %% [markdown]
-# 读表：4K 上下文时 KV 只有 0.5GiB，`--kv-cache-dtype fp8` 几乎看不出区别；
+# **读数**：4K 上下文时 KV 只有 0.5GiB，`--kv-cache-dtype fp8` 几乎看不出区别；
 # 到 128K 上下文，fp16 KV 要 16GiB，和 fp16 权重一样大，理论 tok/s 直接腰斩；
 # 换成 fp8 KV 后损失补回大半——**KV cache 量化是长上下文场景的刚需**，短上下文只是省显存。
 #
-# 最后对照一下 TinyGPT：它的 `parameters × 4B = 11MB`，理论 5 万 tok/s，实测只有几百。
+# 最后对照一下 TinyGPT：它的 `parameters × 4B = 11MB`，按带宽算理论数万 tok/s，实测只有几百。
 
 # %%
 def decode_steps(n: int = 24) -> torch.Tensor:
@@ -435,7 +575,7 @@ tiny_df
 # 原因不是带宽不够，而是固定开销（Python 调度、MPS 命令缓冲、kernel 启动）占绝对主导。
 # 这解释了为什么本章不能"实测 int8 加速"：PyTorch 里把权重量化再反量化只会**多一次读放大**，
 # 真正的收益必须靠 Marlin 这类融合 kernel（int4 权重直接进 tensor core 的寄存器），
-# 也就是 07.4 里 vLLM 干的事。把账本画成图：
+# 也就是 07.5 里 vLLM 干的事。把账本画成图：
 
 # %%
 fig, ax = plt.subplots()
@@ -452,17 +592,19 @@ ax.set_title(f"Half the weights, double the tokens: decode ceiling at {bw_gbps:.
 save(fig, "ch07_decode_budget")
 
 # %% [markdown]
-# 读图：int8 恰好是 fp16 的 2 倍，int4 是 4 倍——**因为 decode 每 token 只读一遍权重，字节数与 tok/s 严格成反比**。
-# 这就是「量化主要收益在 decode」的完整推导：prefill 是 compute-bound，量化省的是带宽不是算力，
-# 在 prefill 上收益有限（还可能因反量化变慢）；decode 的算术强度 ≈ 1 FLOP/byte，带宽减半 = 吞吐翻倍。
+# **读图**：int8 恰好是 fp16 的 2 倍，int4 是 4 倍——因为 decode 每 token 只读一遍权重，
+# 字节数与 tok/s 严格成反比。这就是「量化主要收益在 decode」的完整推导：
+# prefill 是 compute-bound，量化省的是带宽不是算力，在 prefill 上收益有限（还可能因反量化变慢）；
+# decode 的算术强度 ≈ 1 FLOP/byte，带宽减半 = 吞吐翻倍。
 # 下一节看工业实现怎么把「账本上的加速」变成真加速。
 
 # %% [markdown]
-# ## 07.4 对照工业实现（vLLM 0.28.x）
+# ## 07.5 对照工业实现（vLLM）
 #
-# 我们手写的 40 行是"教学版最小闭环"，vLLM 把它拆成了 **配置（Config）+ 方法（LinearMethod）+ kernel** 三层：
+# 本课程锁定 **vLLM 0.28.x**。本章手写的 40 行是"教学版最小闭环"，
+# vLLM 把它拆成了 **配置（Config）+ 方法（LinearMethod）+ kernel** 三层：
 #
-# | 我们的实现 | vLLM 0.28.x 对应物 | 文件 |
+# | 我们的实现 | vLLM 中的对应物 | 真实文件（0.28.x） |
 # | --- | --- | --- |
 # | `absmax_scale`（per-tensor） | `Fp8Config` / `Fp8LinearMethod` 的 per-tensor 缩放 | `vllm/model_executor/layers/quantization/fp8.py` |
 # | per-channel / per-group int4 | `AWQConfig` / `GPTQConfig` + Marlin kernel | `.../quantization/awq.py`、`.../quantization/gptq.py`、`.../quantization/marlin_utils.py` |
@@ -471,7 +613,7 @@ save(fig, "ch07_decode_budget")
 # | 反量化后 matmul | `LinearBase.quant_method.apply` / `process_weights_after_loading` | `.../layers/linear.py` |
 # | 本章的"量化误差"指标 | 模型侧用 perplexity / KL，靠 `lm_eval` 与 `vllm bench` 对比 | — |
 #
-# 怎么在 CLI 里用（0.28.x）：
+# 对应的 CLI（0.28.x）：
 #
 # ```bash
 # # W4A16：权重 int4 + 激活 fp16，Marlin kernel（NVIDIA 上最快的一档）
@@ -484,7 +626,8 @@ save(fig, "ch07_decode_budget")
 # # KV cache 降到 fp8，长上下文 / 大 batch 的显存与带宽双赢
 # vllm serve Qwen/Qwen3-8B --kv-cache-dtype fp8 --calculate-kv-scales
 # ```
-#
+
+# %% [markdown]
 # 我们 vs 它的差距：
 #
 # - **误差补偿**：我们只做 round-to-nearest；GPTQ 用 Hessian 逆把舍入误差逐列补偿，AWQ 用**激活幅值**
@@ -497,10 +640,10 @@ save(fig, "ch07_decode_budget")
 #   由 `vllm/config/cache.py` 的 `CacheConfig.cache_dtype` 控制，attention kernel 按需反量化。
 #
 # 一句话总结：**量化不是"省显存"这么简单，它把 decode 的瓶颈从带宽端挪走，代价是精度和 kernel 复杂度。**
-# 下一章我们换一条完全不改精度的路：用一个小模型猜、用大模型验——投机解码。
+# 下一章换一条完全不改精度的路：用一个小模型猜、用大模型验——投机解码。
 
 # %% [markdown]
-# ## 07.5 练习与小结
+# ## 07.6 练习与小结
 #
 # **练习**（参考答案见 `solutions/07_exercises.py`）
 #
@@ -523,8 +666,12 @@ save(fig, "ch07_decode_budget")
 # - 7B/8B 在 fp16/int8/int4 下的权重显存与 decode 理论 tok/s，以及为什么量化收益集中在 decode。
 # - vLLM 的 `--quantization` / `--kv-cache-dtype fp8` 各自对应本章的哪个概念、源码在哪个目录。
 #
+# **小结与下一章**
+#
+# 量化的收益在 decode 的带宽账本上，代价在精度和 kernel 复杂度上；它把「每 token 读多少字节」
+# 压到原来的 1/2–1/4。下一章换一条不动物理字节、而是减少串行前向次数的路：投机解码。
+#
 # **延伸阅读**
 #
 # - GPTQ（Frantar et al., 2022）、AWQ（Lin et al., 2023）、SmoothQuant（Xiao et al., 2022）
 # - vLLM 文档：Quantization 与 `--kv-cache-dtype`；源码 `vllm/model_executor/layers/quantization/`
-# - 下一章：投机解码——不降低精度，用"猜 + 验"把 decode 的串行步数降下来。

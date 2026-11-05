@@ -1,7 +1,7 @@
 """第 14 章《Capstone 容量规划》练习参考答案。
 
 运行：.venv/bin/python solutions/14_exercises.py
-说明：下面复用了 notebook 14.2 的 plan_capacity()，只改输入参数；所有数字与正文同源。
+说明：下面复用了 notebook 14.3 Step 2 的 plan_capacity()，只改输入参数；所有数字与正文同源。
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ PLANS = {
 
 def plan(params, weight_bytes, n_layer, n_kv_head, head_dim, tp=1, gpu=A100,
          wl=Workload(), util=0.9, workspace_gb=2.0, prefix_hit=0.0) -> dict:
-    """notebook 14.2 的精简版（新增 prefix_hit 用于练习 4）。"""
+    """notebook 14.3 Step 2 的精简版（新增 prefix_hit 用于练习 4）。"""
     weights_bytes = params * weight_bytes
     kv_per_token = 2 * n_layer * n_kv_head * head_dim * 2
     kv_per_req = kv_per_token * (wl.context + wl.output)

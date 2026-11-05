@@ -200,7 +200,7 @@ for M in base kb-lora; do
 done
 cleanup
 
-log "5) 预期现象（对照 13.3 的本地闭环）"
+log "5) 预期现象（对照 13.4 实验 C 的本地闭环）"
 cat <<'TXT'
 - 训练日志：trainable params 应小于总参数的 1%；loss 在前 50 步明显下降。
 - 合并验证：greedy token 序列必须完全一致；不一致通常是 LoRA 打到了 tied 权重上。

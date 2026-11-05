@@ -1,63 +1,179 @@
 # %% [markdown]
 # # 第 03 章 · PagedAttention：用 block table 消灭 KV 显存碎片
 #
-# > 上一章的 KV cache 是按 `max_seq_len` 预分配的：能用，但 74% 的显存躺在碎片里。
+# > 上一章的连续预分配能用，但 200 个长短不一的请求会让 74% 的显存躺在碎片里。
 #
 # | 项目 | 内容 |
 # | --- | --- |
-# | 预计用时 | 75–90 分钟 |
+# | 预计用时 | 90 分钟 |
 # | 运行环境 | 🏠 Mac（MPS / CPU）· 无需 GPU · torch 2.15 |
-# | 前置章节 | 02（KV cache 接口、`append / get / advance / seq_len`） |
-# | 本章产物 | 手写 `BlockManager` + `PagedKVCache` + 分页 attention；200 请求碎片实验；block_size 权衡表 |
+# | 前置章节 | 02（KV cache 接口、连续布局的代价） |
+# | 本章产物 | `BlockManager`、`PagedKVCache`、分页 attention、三组实测（碎片率 / block_size / gather 代价） |
 # | 本章接口 | `PagedKVCache` 与 02 章 `KVCache` 同接口，04 章直接复用 |
 #
 # **学完你能回答：**
-# 1. 连续预分配到底浪费了多少显存？浪费来自哪里（内部碎片 / 外部碎片）？
+# 1. 连续预分配浪费的 74% 显存具体浪费在哪？分页为什么只浪费最后一个 block 的尾部？
 # 2. block table 是怎么把「逻辑位置」映射到「物理 block」的？gather 版 attention 为什么慢？
-# 3. block_size 为什么默认 16？调大调小分别牺牲什么？
+# 3. block_size 越大越好还是越小越好？vLLM 为什么默认 16？
+# 4. 同样一份显存，分页为什么能多服务 3.8 倍请求？
 
 # %% [markdown]
-# ## 03.1 问题与直觉
+# ## 03.0 本章目标与路线
 #
-# 一句话：**KV 显存不该按「最长可能长度」预分配，而该按「实际需要」以固定粒度追加**。
+# **一句话目标**：把 KV 显存从「每个请求按 `max_seq_len` 预留一整块连续区域」改成「按固定大小
+# block 按需申请、用 block table 还原逻辑顺序」，在不改变 attention 数学结果的前提下，把 200 个
+# 真实长度分布的请求的显存碎片率从 73.9% 压到 1.3%。
 #
-# 02 章的做法是每个请求独占一块 `(B, H, max_seq_len, D)` 连续显存。它有两个浪费来源：
+# **代价 / 边界**：分页引入两次额外开销 —— block table 的显存与查询、`get()` 时的 gather 拷贝
+# （把散落的物理 block 拼成逻辑连续张量）。本章分别量化，并说明真实 kernel 如何消掉 gather。
 #
-# - **内部碎片**：请求只用了 400 个 token，却占着 2048 个 token 的位置 → 浪费 80%。
-# - **外部碎片**：不同长度的请求交错到达，释放后留下大小不一的空洞，新请求可能放不进去。
+# **本章交付四样东西**：
 #
-# 分页（PagedAttention）的解法借自操作系统虚拟内存：把 KV 切成固定大小 **block**（默认 16 个
-# token），请求按需申请 block；物理 block 不需要连续，用一张 **block table** 记录
-# 「逻辑第 i 个 block → 物理第几号 block」：
+# | # | 交付物 | 在哪一节 | 怎么验收 |
+# | --- | --- | --- | --- |
+# | 1 | `BlockManager`：物理 block 的分配/追加/回收 | 03.3 Step 1 | 分配-释放账本断言（含双重释放） |
+# | 2 | `PagedKVCache`：分页存储、跨 block 写入、gather 取回 | 03.3 Step 2 | 写入/取回逐元素一致，池字节数符合公式 |
+# | 3 | 分页 attention 接入模型前向 | 03.3 Step 3 | logits 形状正确、无 NaN/Inf |
+# | 4 | 等价性断言 + 三组实验 | 03.3 Step 4、03.4 实验 A/B/C | 与连续布局 logits 一致（atol 1e-5）；趋势与容量公式吻合 |
+#
+# **阅读路线**：03.1 问题 → 03.2 高阶设计 → 03.3 分步实现（4 步，每步有验收）→
+# 03.4 实验（碎片率 / block_size / gather）→ 03.5 对照 vLLM → 03.6 练习。
+
+# %% [markdown]
+# ## 03.1 问题与直觉：一块「预留」的显存，大部分在睡觉
+#
+# 02 章的 KV cache 是**连续预分配**：请求一进来就按 `max_seq_len` 占一整块显存。它简单，
+# attention 取 K/V 零拷贝，但有两个浪费来源：
+#
+# - **内部碎片**：请求只用了 400 个 token，却占着 2048 个 token 的位置 —— 浪费 80%。
+# - **外部碎片**：不同长度的请求交错到达、释放后留下大小不一的空洞，新请求即使总量够也可能放不下。
+#
+# 分页（PagedAttention）借了操作系统虚拟内存的思路：把 KV 切成固定大小的 **block**（默认 16 个
+# token），请求按需申请；物理 block 不必连续，用一张 **block table** 记录「逻辑第 i 块 → 物理第几号块」：
 #
 # ![](../assets/figures/ch03_contiguous_vs_paged.svg)
 #
-# 图里两条关键信息：左边连续布局为了一个长请求预留整块；右边分页布局的 block 散落在池子里，
-# 逻辑顺序由 block table 还原。`get()` 时按 block table 把物理 block `gather` 成逻辑连续的
-# K/V 再送进 attention——这是教学版实现；真实 kernel 直接按 block 遍历，不做这次拷贝。
+# 左边连续布局为了一个长请求预留整块；右边分页布局的 block 散落在池子里，逻辑顺序由 block table
+# 还原。`get()` 时按 block table 把物理 block **gather** 成逻辑连续的 K/V 再送进 attention ——
+# 这是教学版实现；真实 kernel 直接按 block 遍历，不做这次拷贝。03.4 实验 A 会量出碎片率的差别，
+# 实验 C 会量出 gather 的代价。
 
 # %% [markdown]
-# 分页的三个代价，本章都会量化：
+# **关键概念对比与两个子问题**
 #
-# 1. **内部碎片仍存在**，但只浪费「最后一个 block 的尾部」：平均 `(block_size-1)/2` 个 token。
-# 2. **block table 本身要占显存**：每个 block 一个 int，`ceil(len/block_size)` 个条目。
-# 3. **gather 拷贝**：教学版每次 decode 都要把整个前缀拼成连续张量，复杂度 O(长度)。
-#
-# 本章接口（与 02 章严格一致，04 章复用）：
-#
-# | 组件 | 方法 | 说明 |
+# | 维度 | 连续预留（02 章） | 分页（本章） |
 # | --- | --- | --- |
-# | `BlockManager` | `allocate()` / `append(table, length)` / `free(table)` | 只做物理 block id 的分配与回收 |
-# | `PagedKVCache` | `append(layer,k,v)` / `get(layer,upto)` / `advance(n)` / `seq_len` | 与 02 章 `KVCache` 同接口 |
+# | 分配单位 | 一整个 `max_seq_len` | 一个 block（16 token） |
+# | 内部碎片 | 最大 `max_seq_len - len` | 最多 `block_size - 1` 个 token |
+# | 外部碎片 | 有（空洞无法复用） | 无（任何空闲 block 都能用） |
+# | 请求增长 | 不需要（已按上限预留） | 追加新 block |
+# | 物理连续性 | 必须连续 | 不要求 |
+# | 取 K/V | 零拷贝切片 | gather 拷贝（可被 kernel 消除） |
+# | 前缀共享 | 不可能 | 同一 block 可被多请求共享（04 章） |
 #
-# 关键设计：**物理存储按层共享一个池** `(num_blocks, H, block_size, D)`，每个请求只持有
-# 自己的 block table，因此同一份物理显存可以被任意多个请求按需切分。
+# 把上一章的问题变成两个可验收的子问题：
+#
+# 1. **正确性**：分页布局只是「物理地址变了」，attention 的数学结果必须与连续布局**逐元素一致**。
+#    这是本章所有断言里最硬的一条（Step 4）。
+# 2. **成本**：分页换来显存利用率，代价是 block table 与 gather。哪一项更大、什么时候划算，
+#    必须用数字回答（实验 A/B/C）。
 
 # %% [markdown]
-# ## 03.2 从零实现
+# ## 03.2 高阶设计
 #
-# 先准备模型和设备。为了验证分页实现没有改变数学结果，我们保留 02 章的连续 `KVCache`
-# 作为参考实现（这一章会内联一份最小版，保证章节自包含）。
+# 动手前先把方案定下来。整章只有三个组件和一条数据流。
+#
+# **组件 1：存什么（物理池 + block table）**
+#
+# 物理显存按层预分配成一个池：每层 `(num_blocks, H_kv, block_size, D)` 的 K 张量和 V 张量，
+# 整个池子被所有请求共享。每个请求只持有一张小的 **block table**（`list[int]`），长度为
+# `ceil(当前长度 / block_size)`。逻辑位置 `p` 对应的物理位置是：
+#
+# ```text
+# block_id = block_table[p // block_size]
+# offset   = p % block_size
+# ```
+#
+# 这层间接寻址是分页的全部魔法：**逻辑连续，物理离散**。`BlockManager` 只回答「下一个可用物理块
+# 是几号」，不碰显存内容，所以显存池可以跨请求共享，也方便 04 章加引用计数。
+
+# %% [markdown]
+# **组件 2：怎么用（写入与取用）**
+#
+# - 写入：新 token 的 K/V 按逻辑位置 `p` 拆到「已拥有的最后一个 block 的空位」或「新申请的
+#   block」里；一个 token 可能跨 block 边界，所以要按段写。
+# - 取用：`get()` 用 `block_table[:ceil(end/bs)]` 做 `index_select`，把物理 block 拼成
+#   `(1, H, nb*bs, D)` 的连续张量，再切到 `end`。attention 代码**一行都不用改**。
+# - 代价：这次拼接是 O(长度) 的拷贝；前缀越长，单次 decode 的额外成本越明显（实验 C 量化）。
+#
+# **组件 3：谁调度（生命周期）**
+#
+# - 请求创建：`block_table = []`；
+# - prefill：`append` 按需向 manager 申请 block，写入 prompt 的 K/V；
+# - decode：每步 `append` 1 个 token，所有层写完后 `advance(1)`；
+# - 请求结束：`free(block_table)`，所有物理 block 回到池子。
+
+# %% [markdown]
+# 数据流：
+#
+# ```text
+# 请求 tokens
+#    │
+#    ├─ BlockManager.append(block_table, length)   按需申请物理 block
+#    ├─ 写 K/V 到 block_table[p // bs][:, p % bs]  按段写入
+#    ├─ PagedKVCache.get(layer, upto)              gather 成逻辑连续张量
+#    └─ attention(q, k_all, v_all)                 与 02 章完全相同
+# 请求结束
+#    └─ BlockManager.free(block_table)             归还物理 block
+# ```
+
+# %% [markdown]
+# ### 接口契约
+#
+# 上层 attention 只认 02 章的四个方法；分页把「物理怎么摆」藏在下面。本章新增的
+# `BlockManager` 与 `PagedKVCache` 分工如下：
+#
+# | 组件 | 方法 | 语义 |
+# | --- | --- | --- |
+# | `BlockManager` | `allocate()` | 取一个空闲物理 block，返回 id |
+# | `BlockManager` | `append(block_table, length)` | 保证能容纳 `length` 个 token，返回本次新分配的 block |
+# | `BlockManager` | `free(block_table)` | 归还整张表并清空它 |
+# | `PagedKVCache` | `append(layer, k, v)` | 与 02 章同名同义，内部跨 block 写 |
+# | `PagedKVCache` | `get(layer, upto=None)` | 返回**逻辑连续**的 K/V（gather 后） |
+# | `PagedKVCache` | `advance(n)` / `seq_len` | 逻辑长度，语义与 02 章完全一致 |
+#
+# 关键时间线：一次 decode step 里，`seq_len = n` 时每层 `append` 把 K/V 写到逻辑位置 n，
+# L 层都写完后才 `advance(1)`；`get` 的 `upto = seq_len + T` 决定要 gather 到哪个 block。
+
+# %% [markdown]
+# ### 验收标准
+#
+# | 步骤 | 验收 |
+# | --- | --- |
+# | Step 1 BlockManager | 分配/释放账本正确；双重释放被断言拦住 |
+# | Step 2 PagedKVCache | 130 token = 9 个 block；写入/取回逐元素一致；池字节数符合公式 |
+# | Step 3 接入 attention | 整模型前向 logits 形状正确、无 NaN/Inf |
+# | Step 4 等价性 | 分页 vs 连续 logits 最大误差 < 1e-5；block 账本无泄漏 |
+
+# %% [markdown]
+# ## 03.3 从零实现：分四步
+#
+# 按「存 → 用 → 接 → 证」四步走，每步先讲目标和做法，再给代码，最后给验收：
+#
+# | Step | 做什么 | 代码 |
+# | --- | --- | --- |
+# | 1 | 管理物理 block 的分配/追加/回收 | `BlockManager` |
+# | 2 | 分页存储 + 跨 block 写入 + gather 取回 | `PagedKVCache` |
+# | 3 | 把分页缓存接进 attention 与模型前向 | `attention_with_cache` / `forward_with_cache` |
+# | 4 | 证明分页与连续布局等价、账本无泄漏 | `assert` 断言 |
+
+# %% [markdown]
+# ### 准备：模型、设备与 02 章的参考实现
+#
+# 本章仍然用 2.8M 的 TinyGPT（随机权重，只关心形状与带宽）。为了让 Step 4 能证明「分页没改变
+# 数学结果」，先把 02 章的连续 `KVCache` 内联一份最小实现作为参考 —— 它也是实验里的对照对象。
+#
+# 代码从仓库根目录导入 `aiinfra` 的模型与测量工具：
 
 # %%
 import math
@@ -89,8 +205,7 @@ print(f"device = {device} | params = {model.num_params() / 1e6:.2f}M | H={H} D={
 # %% [markdown]
 # ### 参考实现：02 章的连续 KVCache
 #
-# 只保留本章对比需要的四个方法。`get` 返回的是**视图**（切片），没有拷贝——这正是分页版
-# 要付代价的地方。
+# 只保留对比需要的四个方法。`get` 返回**视图**（切片），没有拷贝 —— 这正是分页版要付代价的地方。
 
 # %%
 class KVCache:
@@ -121,13 +236,13 @@ class KVCache:
         return self._len
 
 # %% [markdown]
-# ### BlockManager：只做 id 级分配
+# ### Step 1 · BlockManager：只做 id 级分配
 #
-# 注意它**不碰显存**：物理 block 的 K/V 张量由调用方一次性申请，manager 只负责回答
-# 「下一个可用物理块是几号」。这样显存池可以跨请求共享，也方便做引用计数（04 章）。
+# **目标**：把「哪些物理 block 空闲、下一个用几号」封装起来，完全不碰显存内容。
 #
-# `append(table, length)` 是关键：它把「长度 → 需要几个 block」的换算收敛到一个地方，
-# 与 vLLM 的 `allocate_slots()` 语义对齐。`free` 会清空传入的 block table，并用断言防双重释放。
+# **做法**：维护一个空闲 id 列表 + 一个集合（O(1) 判重复释放）；`append(table, length)` 把
+# 「长度 → 需要几个 block」的换算收敛到一个地方，对应 vLLM 的 `allocate_slots()` 语义；
+# `free` 清空传入的 block table，并用断言防双重释放 —— 账本错了在推理服务里极难排查。
 
 # %%
 class BlockManager:
@@ -170,14 +285,34 @@ class BlockManager:
     def num_free_blocks(self):
         return len(self._free)
 
+# %%
+# 验收：8 个 block 的池子里申请 3 块、释放后回到 8 块；重复释放被断言拦住
+bm_demo = BlockManager(num_blocks=8, block_size=4)
+table = []
+new_blocks = bm_demo.append(table, length=10)  # ceil(10/4) = 3 块
+assert table == [0, 1, 2] and new_blocks == [0, 1, 2]
+assert bm_demo.num_allocated == 3 and bm_demo.num_free_blocks == 5
+assert bm_demo.append(table, length=10) == []  # 容量够，不再分配
+bm_demo.free(table)
+assert bm_demo.num_allocated == 0 and bm_demo.num_free_blocks == 8
+try:
+    bm_demo.free([0])
+    raise AssertionError("双重释放没有被拦住")
+except AssertionError as exc:
+    assert "double free" in str(exc)
+print("BlockManager 账本 ✓：申请 3 块 → 释放 → 空闲 8 块；重复释放被断言拦截")
+
 # %% [markdown]
-# ### PagedKVCache：同一个接口，不同的物理布局
+# **验收**：申请 3 块、释放后回到 8 块；重复释放触发断言 —— 分配/回收账本不变量成立。
+
+# %% [markdown]
+# ### Step 2 · PagedKVCache：物理分页，逻辑连续
 #
-# - `append`：先让 manager 保证容量，然后**跨 block 边界分段写入**。最后一段往往只写半个 block
-#   （这就是内部碎片的来源）。
-# - `get`：用 `block_table[:nb]` 做 `index_select`，把物理 block 拼成 `(1, H, nb*bs, D)` 的连续
-#   张量，再切到 `end`。**这次拷贝就是教学版的性能代价**。
-# - `advance` / `seq_len` 与 02 章完全一致：所有层写完之后才推进长度。
+# **目标**：在分页布局上实现与 02 章相同的四个方法（`append / get / advance / seq_len`）。
+#
+# **做法**：`append` 先让 manager 保证容量，再按段写入；最后一段往往只写半个 block（内部碎片就
+# 来源在这里）。`get` 用 `block_table` 做 `index_select` 拼出逻辑连续张量，再切到 `end`。
+# 注意 `get` 返回的是**拷贝**而不是视图 —— 实验 C 会量出它的成本。
 
 # %%
 class PagedKVCache:
@@ -216,12 +351,37 @@ class PagedKVCache:
     def seq_len(self):
         return self._len
 
+# %%
+# 验收：130 个 token = 9 个 block；写入/取回逐元素一致；池字节数符合公式
+BS_DEMO, N_DEMO = 16, 64
+bm_demo = BlockManager(N_DEMO, BS_DEMO)
+k_demo = [torch.zeros(N_DEMO, H, BS_DEMO, D, device=device) for _ in range(NL)]
+v_demo = [torch.zeros(N_DEMO, H, BS_DEMO, D, device=device) for _ in range(NL)]
+cache_demo = PagedKVCache(cfg, bm_demo, k_demo, v_demo, device)
+k_in = torch.randn(1, H, 130, D, device=device)
+v_in = torch.randn(1, H, 130, D, device=device)
+with torch.no_grad():
+    cache_demo.append(0, k_in, v_in)
+cache_demo.advance(130)
+k_out, v_out = cache_demo.get(0)
+assert len(cache_demo.block_table) == 9 and bm_demo.num_allocated == 9
+assert torch.equal(k_out, k_in) and torch.equal(v_out, v_in)
+pool_bytes_demo = sum(t.nbytes for t in k_demo + v_demo)
+assert pool_bytes_demo == kv_cache_bytes(NL, H, D, BS_DEMO, N_DEMO, 4)
+print(f"PagedKVCache ✓：130 token → {len(cache_demo.block_table)} 个 block，取回逐元素一致")
+
 # %% [markdown]
-# ### 分页 attention：只需复用 02 章的 mask 逻辑
+# **验收**：130 个 token 用 block_size=16 正好占 9 个 block（8 满 + 1 半）；写入的 K/V 取回后
+# 逐元素相等；池字节数 == `2 × L × H × D × num_blocks × block_size × dtype`。
+
+# %% [markdown]
+# ### Step 3 · 接进 attention 与模型前向
 #
-# 分页缓存已经把 K/V 拼成逻辑连续张量，所以 attention 本身**一行都不用改**——这正是把
-# 「布局」和「计算」解耦的价值。真实 vLLM 的 kernel 不做这次拼接，而是直接在 block 上算
-# （见 03.4 节）。
+# **目标**：让分页缓存对上层完全透明 —— 换掉物理布局，不改 attention。
+#
+# **做法**：分页缓存已经把 K/V 拼成逻辑连续张量，所以 attention 本身一行都不用改（含 mask 语义）；
+# `forward_with_cache` 只负责把每层 attention 换成缓存版。真实 vLLM 的 kernel 不做拼接，而是
+# 直接在 block 上算（见 03.5 节）。
 
 # %%
 def attention_with_cache(attn, x, cache, layer, start_pos):
@@ -248,12 +408,29 @@ def forward_with_cache(model, idx, cache, start_pos=0):
         x = x + block.mlp(block.norm2(x))
     return model.lm_head(model.norm_f(x))
 
+# %%
+# 验收：分页缓存下整模型前向 logits 形状正确、全部有限
+bm_smoke = BlockManager(32, 16)
+k_smoke = [torch.zeros(32, H, 16, D, device=device) for _ in range(NL)]
+v_smoke = [torch.zeros(32, H, 16, D, device=device) for _ in range(NL)]
+paged_smoke = PagedKVCache(cfg, bm_smoke, k_smoke, v_smoke, device)
+tokens_smoke = torch.randint(0, cfg.vocab_size, (1, 48), device=device)
+with torch.no_grad():
+    logits_smoke = forward_with_cache(model, tokens_smoke, paged_smoke)
+assert logits_smoke.shape == (1, 48, cfg.vocab_size)
+assert torch.isfinite(logits_smoke).all()
+print(f"分页前向 ✓：logits 形状 {tuple(logits_smoke.shape)}，全部有限")
+
 # %% [markdown]
-# ### 正确性断言：分页实现必须与连续实现逐元素一致
+# **验收**：分页缓存下整模型前向的 logits 形状为 `(1, 48, vocab)`，全部有限（无 NaN/Inf）。
+
+# %% [markdown]
+# ### Step 4 · 验收：分页必须与连续布局逐元素一致
 #
-# 除了 logits 一致，还要断言 block 账本：130 个 token 用 block_size=16 应该占 9 个 block
-# （8 个满 + 1 个半满），释放后 `num_allocated` 回到 0，双重释放必须被断言拦住。
-# 另外用 `tensor.nbytes` 验证分页池的显存正好是 `2 × L × H × D × num_blocks × block_size × dtype`。
+# **目标**：用断言钉死「只是地址变了，数学没变」。
+#
+# **做法**：同一个 prompt 分别走连续布局与分页布局，比较 logits；再断言 block 账本：
+# 130 个 token 应占 9 个 block，释放后 `num_allocated` 回到 0，双重释放必须被拦住。
 
 # %%
 BS = 16
@@ -286,18 +463,45 @@ except AssertionError as exc:
 print(f"分页 vs 连续：logits 最大误差 = {gap:.2e} | block 账本 ✓ | 池 {pool_bytes / 2**20:.1f} MiB")
 
 # %% [markdown]
-# ## 03.3 实测
+# **结论**：分页与连续布局 logits 最大误差为 0（阈值 1e-5），block 账本断言全部通过。
+# 正确性有了，03.4 用三组实验回答「分页到底省了多少显存、代价有多大」。
+
+# %% [markdown]
+# ## 03.4 实测
 #
-# ### 实验 1：200 个不同长度请求的碎片率
+# 三个实验，分别回答三个问题：
 #
-# 请求长度服从对数正态分布（均值约 534、中位数 416、最长 1985），模拟真实流量的长尾。
-# 对比四种分配方案：
+# | 实验 | 问题 | 产出 |
+# | --- | --- | --- |
+# | A | 200 个真实长度请求，连续预留 vs 分页各浪费多少显存？ | 碎片率/利用率表 + 容量内请求数 |
+# | B | block_size 16/32/64 怎么权衡？ | block table 开销表 |
+# | C | 分页的 gather 代价有多大？ | 每次 `get()` 的耗时表 + 曲线 |
 #
-# - **连续预留**：每个请求按 `max_seq_len=2048` 预留（02 章的做法）。
-# - **分页**：block_size = 16 / 32 / 64，按需追加。
+# 测量协议（实验 C）：M3 Ultra / 96GB / torch 2.15 / MPS，`warmup=3, reps=9` 取中位数；
+# 实验 A/B 是账本模拟，不跑模型。请求长度用固定 seed 的对数正态分布生成。
+# 绝对值随机器变化，**趋势才是结论**。
+
+# %% [markdown]
+# ### 实验 A · 200 个请求的碎片率与容量
 #
-# 同时用 `BlockManager` 真实地分配/回收一遍，统计「固定 65536 token 池（32K 上下文 × 2 请求
-# 的显存）能同时容纳多少个请求」。注意：这是**账本模拟**，不分配真实 KV 张量。
+# **问题**：02 章的连续预留，在真实长度分布下到底浪费多少？分页能省多少？
+#
+# **协议**：200 个请求，长度服从对数正态分布（均值约 534、中位数 416、最长 1985）；
+# 对比「连续预留 max_seq_len=2048」与 block_size=16/32/64 的分页；再用同一个 65536-token 池
+# （32K 上下文 × 2 请求的显存量）模拟「能同时容纳多少请求」。注意：这是**账本模拟**，
+# 只分配 block id，不分配真实 KV 张量。
+#
+# **公式**：设请求长度为 `len_i`、分配粒度为 `bs`，则
+#
+# ```text
+# 连续预留：allocated = N × max_seq_len
+# 分页：    allocated = Σ ceil(len_i / bs) × bs
+# 利用率   = Σ len_i / allocated
+# 碎片率   = 1 - 利用率
+# ```
+#
+# 分页的内部碎片每请求最多 `bs-1` 个 token，平均约 `(bs-1)/2`；连续预留每请求最多
+# `max_seq_len - len`。这就是两者差一个数量级的原因。
 
 # %%
 rng = np.random.default_rng(0)
@@ -321,6 +525,7 @@ rows.append(
 
 # %% [markdown]
 # 连续预留这一行直接算；分页方案用 `BlockManager` 真实分配一遍：同一个池子谁能装下更多请求。
+
 # %%
 for bs in [16, 32, 64]:
     blocks = -(-lengths // bs)
@@ -357,6 +562,17 @@ df_frag
 # 注意 block_size 的权衡已经显现：bs 从 16 → 64，碎片率 1.3% → 5.4%，可容纳请求数 116 → 111，
 # 但 block table 条目少了 3.8 倍。下一张表把「block table 开销」单独拉出来看。
 
+# %% [markdown]
+# ### 实验 B · block_size 的权衡
+#
+# **问题**：block 越小碎片越少，但 block table 条目越多；到底谁主导？
+#
+# **协议**：同一批 200 个请求，只改 block_size = 16/32/64；换算成 Qwen3-8B fp16 的 KV 口径
+# （每 token 144 KiB），看 block table 显存占 KV 的比例。
+#
+# **公式**：`block table 字节数 = Σ ceil(len_i / bs) × 4`（每个条目一个 int32）；
+# `table / KV 比例 = table 字节数 / (allocated_tokens × 每 token 字节数)`。
+
 # %%
 rows = []
 for bs in [16, 32, 64]:
@@ -386,11 +602,13 @@ df_table
 # 这就是 vLLM 默认 `block_size=16` 的原因：在碎片率和 kernel 效率之间取平衡。
 
 # %% [markdown]
-# ### 实验 2：分页的代价——每次 decode 多付一次 gather
+# ### 实验 C · gather 的代价
 #
-# 教学版 `get()` 每次 decode 都要把整个前缀 gather 成连续张量，成本 O(长度)；而连续布局的
-# `get` 只是切片，**零拷贝**。下面直接测「取一次全部层的 K/V」要花多久（同一模型、同一上下文，
-# 9 次中位数）。这比测端到端 decode 更干净：端到端会被每次前向的固定开销淹没（见 00 章的噪声）。
+# **问题**：分页把连续切片换成了 gather 拷贝，每次 decode 多付多少？
+#
+# **协议**：同一模型、同一上下文，分别测「取一次全部层的 K/V」的耗时（9 次中位数）。
+# 连续布局的 `get` 是零拷贝切片，分页布局的 `get` 要物化前缀。这比测端到端 decode 更干净：
+# 端到端会被每次前向的固定开销淹没（00 章讲过）。
 
 # %%
 rows = []
@@ -458,7 +676,7 @@ save(fig, "ch03_gather_overhead");
 # 顺带一提：绝对延迟随机器变化，趋势（分页 O(L) vs 连续 O(1)）才是可迁移的结论。
 
 # %% [markdown]
-# ## 03.4 对照工业实现（vLLM）
+# ## 03.5 对照工业实现（vLLM）
 #
 # vLLM 0.28.x（v1 engine）把本章的三件事拆成了独立模块：
 #
@@ -474,7 +692,7 @@ save(fig, "ch03_gather_overhead");
 #
 # | 参数 | 本章的哪个量 | 取值/说明 |
 # | --- | --- | --- |
-# | `--block-size`（`block_size`） | 实验 1/2 的 block 粒度 | 默认 16；kernel 会按 16/32/64 特化 |
+# | `--block-size`（`block_size`） | 实验 A/C 的 block 粒度 | 默认 16；kernel 会按 16/32/64 特化 |
 # | `--gpu-memory-utilization` | 物理池总大小 `num_blocks × block_size` | 默认 0.9，决定 `num_gpu_blocks` |
 # | `--max-num-seqs`（`max_num_seqs`） | 「池内可容纳请求数」 | 同时调度的请求上限 |
 # | `--max-num-batched-tokens` | 一次 prefill/decode 的 token 预算 | 影响 block 分配节奏 |
@@ -493,11 +711,11 @@ save(fig, "ch03_gather_overhead");
 # 只有 `CacheConfig` 和 `BlockPool`。
 
 # %% [markdown]
-# ## 03.5 练习与小结
+# ## 03.6 练习与小结
 #
 # **练习**
 #
-# 1. ⭐ 把 block_size 改成 8 / 128，重跑实验 1 和实验 2。碎片率、block table 条目、gather
+# 1. ⭐ 把 block_size 改成 8 / 128，重跑实验 A 和实验 C。碎片率、block table 条目、gather
 #    延迟分别怎么变？为什么 vLLM 不选 8 或 128？
 # 2. ⭐ 把请求长度分布换成均匀分布 U(16, 2048) 和重尾分布（lognormal σ=1.5），重复碎片实验，
 #    解释「碎片率对流量分布有多敏感」。

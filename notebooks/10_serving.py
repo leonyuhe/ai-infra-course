@@ -1,47 +1,156 @@
 # %% [markdown]
 # # 第 10 章 · 用 vLLM 提供服务
 #
-# > 09 章看的是内部结构；这一章把服务真的跑起来：Mac 上用 `vllm-metal`，云上用官方镜像，然后用 `httpx` 把 OpenAI 兼容 API 逐个打一遍。
+# > 09 章看的是内部结构；这一章把服务真正跑起来：Mac 上用 `vllm-metal`，云上用官方镜像，然后用 `httpx` 把 OpenAI 兼容 API 逐个打一遍。
 #
 # | 项目 | 内容 |
 # | --- | --- |
-# | 预计用时 | 60–75 分钟 |
+# | 预计用时 | 75–90 分钟 |
 # | 运行环境 | 🏠 Mac（有 `vllm-metal` 时在线）· 无服务时自动回放 `cloud/fixtures/` |
-# | 前置章节 | 09 |
-# | 锁定版本 | vLLM 0.28.x（Mac: vllm-metal；云: vllm/vllm-openai 镜像） |
-# | 本章产物 | 部署拓扑、启动命令、OpenAI 接口契约表、10 条 smoke test、显存/成本估算 |
+# | 前置章节 | 09（vLLM 分层与请求生命周期） |
+# | 本章产物 | 部署拓扑、三套启动命令、OpenAI 接口契约表、10 条 smoke test、显存/成本估算 |
+# | 本章接口 | `VLLMClient.chat / embed / mode`；无服务时返回同构的回放结果 |
 #
 # **学完你能回答：**
 # 1. 在 Mac 和云上分别怎么起一个 OpenAI 兼容服务？关键参数有哪些？
-# 2. `/v1/chat/completions`、`/v1/completions`、`/v1/embeddings` 的请求和响应长什么样？
+# 2. `/v1/chat/completions`、`/v1/completions`、`/v1/embeddings` 的请求和响应字段分别是什么？
 # 3. LoRA 多适配器、结构化输出、工具调用分别要开哪些参数？
 # 4. Qwen3-8B / 27B 在 24/48/80GB 卡上、不同精度下能开多少并发？每百万 token 大概多少钱？
 
 # %% [markdown]
-# ## 10.1 问题与直觉
+# ## 10.0 本章目标与路线
 #
-# 把模型跑起来不难，难的是**让所有客户端不用改代码就能用**。业务方只认 OpenAI 的 JSON 格式：`messages` 进、`choices[].message` 出、流式走 SSE、错误码是 400/422/429。vLLM 的 API Server 负责把这套「世界语」翻译成引擎内部的 `EngineCoreRequest`。
+# **一句话目标**：把 vLLM 服务真正跑起来（Mac 用 `vllm-metal`、云上用 Docker），
+# 并用一个「有服务走 HTTP、没服务回放 fixture」的客户端逐个验证 OpenAI 兼容接口的契约。
+#
+# **代价与边界**：
+# - 本地没有 vLLM 服务，所以本章默认走**回放**；所有在线代码路径都在，但没有服务时不会执行；
+# - 不 pip 安装、不联网、不下载模型；回放数据来自 `cloud/fixtures/`（示例录制，非本机实测）；
+# - 显存/成本表是**公式估算**，用示例价格与回放吞吐，绝对值以真机为准。
+#
+# **本章交付物**：
+#
+# | # | 交付物 | 在哪一节 | 怎么验收 |
+# | --- | --- | --- | --- |
+# | 1 | Mac / 云上 / compose 三套启动命令 | 10.3 Step 1 | 命令能打印，关键参数齐全 |
+# | 2 | 可降级的 `VLLMClient`（httpx + fixture） | 10.3 Step 2–3 | 无服务时返回 `replay=True` 且不报错 |
+# | 3 | 10 条 smoke test | 10.4 实验 A | 9 条 200 + 1 条 400，字段完整 |
+# | 4 | 显存账本 + 成本估算 | 10.4 实验 B/C | 8B/27B × 精度 × 卡型可复算 |
+# | 5 | 接口契约表 + vLLM 实现映射 | 10.2 / 10.5 | 每个 endpoint 能说出请求/响应字段 |
+#
+# **阅读路线**：10.1 问题 → 10.2 高阶设计（拓扑 + 契约）→ 10.3 分四步实现
+# → 10.4 实验 A/B/C → 10.5 对照 vLLM → 10.6 练习。
+
+# %% [markdown]
+# ## 10.1 问题与直觉：手工调用 vs HTTP 服务
+#
+# 09 章你已经看到了内部对象。如果业务方直接用 Python 调 engine，会发生什么？
+# 每个调用方都要自己处理 tokenize、流式拼接、`usage` 计数、重试、错误码、并发限流；
+# 换模型时全部客户端重写——这是「没有协议」的代价。
+#
+# vLLM 的做法是在引擎外面加一层 OpenAI 兼容 API Server，把内部对象翻译成标准 JSON：
+# `messages` 进、`choices[].message` 出、流式走 SSE、错误码是 400/422/429。
+#
+# 部署拓扑与 API 契约放在 10.2 一起看。先记住一个反例：如果不用兼容层，每个业务方都要自己实现 tokenize、流式拼接、重试、token 计数；
+# 换模型时全部客户端重写。这就是「协议」的价值：把变化关在服务端。
+
+# %% [markdown]
+# | 维度 | 手工调用引擎 | HTTP + OpenAI 兼容 API |
+# | --- | --- | --- |
+# | 调用方式 | Python 对象、进程内 | HTTP/JSON，跨语言跨进程 |
+# | 流式 | 自己实现生成器 | SSE，标准 `data:` 帧 |
+# | 错误处理 | 抛异常 | 状态码 400/422/429/503 |
+# | 多租户 | 自己做鉴权限流 | `--api-key` + 网关 |
+# | 换模型 | 改调用方代码 | 改服务端 `--model` |
+#
+# 本章要解决的两个子问题：
+#
+# - **契约正确性**：三种 endpoint 的请求/响应字段、状态码、流式格式是否与 OpenAI 一致？
+# - **成本**：给定模型 / 精度 / 卡型，能开多少并发？每百万 token 多少钱？
+#
+# 运行环境的选择也影响契约验证方式：有服务就测真实 HTTP，没服务就回放录制响应——
+# 但**断言完全相同**，这是本章能在 Mac 上跑通的关键。
+
+# %% [markdown]
+# ## 10.2 高阶设计：部署拓扑、API 契约与客户端降级
+#
+# 先看部署拓扑：
 #
 # ![](../assets/figures/ch10_topology.svg)
 #
 # 图里三个要点：
 #
-# 1. **两种部署形态共用同一套 API**：Mac 上是单进程 Metal worker，云上是「API+EngineCore 容器 + 多个 GPU worker」，客户端代码一行不用改；
-# 2. **能力是叠加的**：LoRA 适配器、embeddings 实例、Prometheus 指标都是并列的附加件，不是重写服务；
-# 3. **关机是流程的一部分**：图底部的 checklist 不是玩笑，按小时计费的卡忘关一晚，预算就没了。
-#
-# **反例**：如果不用兼容层，每个业务方都要自己实现 tokenize、流式拼接、重试、token 计数；换模型时全部客户端重写。这就是「协议」的价值：把变化关在服务端。
+# 1. **两种部署形态共用同一套 API**：Mac 单进程 Metal worker，云上「API+EngineCore 容器 + 多 GPU worker」，客户端代码不变；
+# 2. **能力是叠加的**：LoRA 适配器、embeddings 实例、Prometheus 指标都是并列附加件，不是重写服务；
+# 3. **关机是流程的一部分**：按小时计费的卡忘关一晚，预算就没了。
 
 # %% [markdown]
-# ## 10.2 从零实现：启动命令 + 一个会降级的客户端
+# **组件 1：部署拓扑（进程怎么放）**
+# - 本机：`vllm-metal` 提供单进程服务，8000 端口；
+# - 云上：`vllm/vllm-openai` 容器暴露 8000，容器内 API Server + EngineCore，GPU worker 由 `--tensor-parallel-size` 决定；
+# - 附加件：HF cache 挂载（避免重下 16GB）、LoRA 适配器目录、独立 embeddings 实例（`--task embed`，另一个端口）。
 #
-# 先写启动方式。下面三种任选其一，**不要同时跑**（8000 端口会冲突）：
+# **组件 2：API 契约（客户端只见协议）**
+# 本章只依赖 4 个入口：`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/health`。
+# 请求字段与响应字段见下面的契约表；实现细节（LoRA adapter、guided decoding、tool parser）都藏在服务端。
 #
-# | 场景 | 命令 | 说明 |
+# **组件 3：客户端降级（没有服务也要能跑）**
+# `VLLMClient` 启动时探测 `/health`：200 → 在线模式，走真实 HTTP 流式；
+# 否则 → 回放模式，按 fixture 顺序返回录制响应，并在表里标注「回放」。
+# 两种模式返回**同构 dict**，上层实验代码不区分。
+#
+# 数据流：
+#
+# ```text
+# 业务请求 → (在线) HTTP/SSE / (回放) fixture ──→ 统一 dict → 断言 / 表格 / 图
+# ```
+
+# %% [markdown]
+# ### 接口契约
+#
+# | Endpoint | 关键请求字段 | 关键响应字段 | 用途 |
+# | --- | --- | --- | --- |
+# | `POST /v1/chat/completions` | `model` `messages` `max_tokens` `temperature` `stream` `tools` `tool_choice` `response_format` | `choices[].message`、`finish_reason`、`usage` | 对话 / 工具调用 / 结构化输出 |
+# | `POST /v1/completions` | `model` `prompt` `max_tokens` `n` `stream` | `choices[].text`、`usage` | 纯文本补全 |
+# | `POST /v1/embeddings` | `model` `input` `encoding_format` | `data[].embedding`、`usage` | 向量化（需 `--task embed`） |
+# | `GET /health` | — | 200 = 就绪 | 客户端探测 / 负载均衡 |
+#
+# 客户端方法（在线 / 回放两种实现）：
+#
+# | 方法 | 在线行为 | 回放行为 |
 # | --- | --- | --- |
-# | Mac 单机体验 | `brew tap vllm-project/vllm-metal` → `brew install vllm-metal` → `vllm serve ...` | 需要 Apple Silicon，Metal 后端；命令以 tap 的 README 为准（版本待核对） |
-# | 云上 Docker | `cd cloud && docker compose up -d` | 镜像 `vllm/vllm-openai:v0.28.0`，挂载 HF cache |
-# | 云上裸 docker run | 见下面输出 | 临时调试用，验证完就删 |
+# | `chat(payload, idx)` | POST 流式，记录首块时间与 token 数 | 返回 `records[idx]` 的录制响应 |
+# | `embed(record)` | POST `/v1/embeddings` | 返回录制响应 |
+# | `mode()` | `"在线"` | `"回放"` |
+
+# %% [markdown]
+# ### 验收标准
+#
+# | 步骤 | 验收 |
+# | --- | --- |
+# | Step 1 启动命令 | 三套命令 + 生产参数打印完整，`--enable-lora` 等关键开关存在 |
+# | Step 2 fixture / 环境 | 三个 JSON 可读；`httpx` 缺失时客户端仍可回放 |
+# | Step 3 客户端 | 无服务时 `online=False`，`chat/embed` 返回 200 记录且不抛异常 |
+# | Step 4 高级能力 | JSON Schema 可解析、`tool_calls` 形状正确、embedding 维度正确 |
+# | 实验 A/B/C | 10 条 smoke = 9 + 1；显存表可复算；成本表可复算 |
+
+# %% [markdown]
+# ## 10.3 从零实现：分四步
+#
+# | Step | 做什么 | 代码 / 命令 |
+# | --- | --- | --- |
+# | 1 | 起服务：Mac / 云 / compose / 生产参数 | 命令生成 + `PROD_FLAGS` |
+# | 2 | 环境与回放数据 | imports + fixture 校验 |
+# | 3 | 可降级客户端 | `_post_stream` / `VLLMClient` |
+# | 4 | 验证高级能力 | JSON Schema / `tool_calls` / embeddings |
+
+# %% [markdown]
+# ### Step 1 · 起服务命令
+#
+# 目标：给出三条可复制的启动路径，以及一条「能力全开」的生产参数。
+#
+# 做法：三种方式任选其一，**不要同时跑**（8000 端口会冲突）；首次启动要下载模型（8B 约 16GB），
+# 看到 `Application startup complete` 后用 `curl $BASE/health` 验证。
 
 # %%
 MODEL = "Qwen/Qwen3-8B"
@@ -90,7 +199,16 @@ print(PROD_FLAGS)
 assert "--enable-lora" in PROD_FLAGS and "--enable-auto-tool-choice" in PROD_FLAGS
 
 # %% [markdown]
-# 客户端只用 `httpx`，不依赖 `openai` 包。核心设计是**自动降级**：启动时探测 `/health`，通了就走真实 HTTP；不通就读 `cloud/fixtures/` 里录好的响应，并在表里标注「回放」。这样同一份 notebook 在没装 vLLM 的 Mac 上也能跑通，上云后无需改代码。
+# **Step 1 验收**：三套命令都打印完整；生产参数里包含 `--enable-lora`、`--enable-auto-tool-choice`
+# 等关键开关（`assert` 通过）。命令本身不在 notebook 里执行，上云时照抄即可。
+
+# %% [markdown]
+# ### Step 2 · 环境与回放数据
+#
+# 目标：让 notebook 在没有任何服务时也能跑通。
+#
+# 做法：依赖只有标准库 + numpy + pandas；`httpx` 可选（没装就强制回放）。
+# 数据来自 `cloud/fixtures/` 的三个 JSON：chat 响应、embeddings、benchmark 结果。
 
 # %%
 import json
@@ -113,6 +231,19 @@ ROOT = Path.cwd().parent
 FIXTURES = ROOT / "cloud" / "fixtures"
 print("fixtures:", sorted(p.name for p in FIXTURES.glob("*.json")))
 assert (FIXTURES / "chat_completions.json").exists()
+
+# %% [markdown]
+# **Step 2 验收**：三个 fixture 都能被 `json` 读入；`httpx` 缺失时被置为 `None`，
+# 客户端会自动强制回放（下一步实测）。
+
+# %% [markdown]
+# ### Step 3 · 可降级客户端
+#
+# 目标：把「在线 HTTP 流式」与「fixture 回放」封装成同一个接口。
+#
+# 做法：`_post_stream` 记录首 token 时间与 token 数（一个 SSE data 块 ≈ 一个 token）；
+# `VLLMClient` 启动时探测 `/health`，决定走哪条路径。回放模式的提示会打印启动命令，
+# 起好服务后重跑本 cell 即可自动切到在线模式，客户端代码不用改。
 
 # %%
 def _post_stream(base_url: str, path: str, payload: dict) -> dict:
@@ -183,9 +314,63 @@ print("客户端模式 =", client.mode())
 print("fixture 录制说明：", client.chat_fx["provenance"]["note"][:48], "...")
 
 # %% [markdown]
-# ## 10.3 实测：10 条 smoke test
+# **Step 3 验收**：无服务时 `client.online is False`，`mode()` 返回「回放」，
+# 并打印 Mac / 云上的启动命令；有服务时同一份代码切到在线模式。
+
+# %% [markdown]
+# ### Step 4 · 高级能力验收
 #
-# 覆盖 8 种正常 chat 场景 + 1 条按预期失败的请求 + 1 条 embeddings。回放模式下「首 token/首包时间」和「输出 tokens」直接来自 fixture 的录制字段；在线模式下由客户端实测（流式首块 = TTFT）。
+# 目标：用 fixture 里的真实响应验证三种能力在 JSON 里的形状。
+#
+# 做法：结构化输出（`response_format`）→ 合法 JSON；工具调用 → `tool_calls` +
+# `finish_reason="tool_calls"`；embeddings → `data[].embedding` 维度正确。
+# 在线模式下这三条断言同样成立，所以回放不是「假测试」，而是同一契约的录制证据。
+
+# %%
+json_rec = next(r for r in client.chat_fx["records"] if r["case"] == "json-schema")
+parsed = json.loads(json_rec["response"]["choices"][0]["message"]["content"])
+assert set(parsed) == {"model", "weights_gb", "kv_budget_gb"}
+print("structured output（response_format=json_schema）解析成功：", parsed)
+
+tool_rec = next(r for r in client.chat_fx["records"] if r["case"] == "tool-call")
+call = tool_rec["response"]["choices"][0]["message"]["tool_calls"][0]
+assert call["function"]["name"] == "get_weather"
+print("tool calling：", call["function"]["name"], call["function"]["arguments"],
+      "| finish_reason =", tool_rec["response"]["choices"][0]["finish_reason"])
+
+# %%
+emb = client.embed(client.embed_fx["records"][0])
+vec = np.asarray(emb["body"]["data"][0]["embedding"], dtype=float)
+assert vec.shape[0] == client.embed_fx["embedding_dim"]
+pd.DataFrame([{"输入": client.embed_fx["records"][0]["input"], "维度": vec.shape[0],
+               "前 4 维": np.round(vec[:4], 3).tolist(), "首包(ms)": emb["ttft_ms"],
+               "usage": emb["body"]["usage"]}])
+
+# %% [markdown]
+# **Step 4 验收**：JSON Schema 能解析成 dict；`tool_calls[0].function.name == "get_weather"`
+# 且 `finish_reason == "tool_calls"`；embedding 维度等于 fixture 声明的 16。
+
+# %% [markdown]
+# ## 10.4 实测
+#
+# 三个实验，全部在**无服务回放模式**下完成；数据来源是 `cloud/fixtures/`
+# （示例录制：字段结构复刻 vLLM 0.28.x 真实响应，数值为示例量级，非本机实测）。
+#
+# | 实验 | 问题 | 产出 |
+# | --- | --- | --- |
+# | A | 10 种典型请求能不能按契约返回？ | smoke 表（状态码 / 首包 / token 数） |
+# | B | Qwen3-8B / 27B 在不同精度和卡上能开多少 KV？ | 显存表 + 两张图 |
+# | C | 每百万 token 多少钱？ | 成本表 |
+#
+# 测量协议：回放模式直接读取 fixture 的录制字段；在线模式由客户端实测（流式首块 = TTFT）。
+# 所有表都在 Mac CPU 上复算，公式与 fixture 一起构成可复现的账本。
+
+# %% [markdown]
+# ### 实验 A · 10 条 smoke test
+#
+# 协议：8 种正常 chat 场景（基础对话、长上下文、JSON Schema、工具调用、LoRA、temperature=0、
+# max_tokens 截断、中英混合）+ 1 条按预期失败的请求（`max_tokens` 超上下文）+ 1 条 embeddings。
+# 回放模式的「首 token / 首包时间」和「输出 tokens」来自录制字段；在线模式由客户端实测。
 
 # %%
 rows = []
@@ -216,40 +401,23 @@ print(f"成功 {len(ok)}/10；首包中位数 {ok['首 token/首包(ms)'].median
       f"输出 token 合计 {int(ok['输出 tokens'].sum())}")
 
 # %% [markdown]
-# 三条「高级能力」在响应里的形状，回放与在线完全一致，下面用 fixture 里的真实响应直接验证：
-
-# %%
-json_rec = next(r for r in client.chat_fx["records"] if r["case"] == "json-schema")
-parsed = json.loads(json_rec["response"]["choices"][0]["message"]["content"])
-assert set(parsed) == {"model", "weights_gb", "kv_budget_gb"}
-print("structured output（response_format=json_schema）解析成功：", parsed)
-
-tool_rec = next(r for r in client.chat_fx["records"] if r["case"] == "tool-call")
-call = tool_rec["response"]["choices"][0]["message"]["tool_calls"][0]
-assert call["function"]["name"] == "get_weather"
-print("tool calling：", call["function"]["name"], call["function"]["arguments"],
-      "| finish_reason =", tool_rec["response"]["choices"][0]["finish_reason"])
-
-# %%
-emb = client.embed(client.embed_fx["records"][0])
-vec = np.asarray(emb["body"]["data"][0]["embedding"], dtype=float)
-assert vec.shape[0] == client.embed_fx["embedding_dim"]
-pd.DataFrame([{"输入": client.embed_fx["records"][0]["input"], "维度": vec.shape[0],
-               "前 4 维": np.round(vec[:4], 3).tolist(), "首包(ms)": emb["ttft_ms"],
-               "usage": emb["body"]["usage"]}])
+# **读数**：9 条成功、1 条 400，首包中位数约 172 ms，输出 token 合计 488。
+# 错误请求返回 400 且带 `BadRequestError`，说明「参数校验发生在进入引擎之前」——
+# 这正是 API Server 的职责，也是它必须独立于引擎的原因：坏请求不应该占用 GPU。
 
 # %% [markdown]
-# ### 显存估算：权重 × 精度 × `gpu_memory_utilization`
+# ### 实验 B · 显存账本：权重 × 精度 × `gpu_memory_utilization`
 #
-# 公式只有三行，但每个参数都能解释一个线上事故：
+# 协议：按三条公式估算，再用 `kv_cache_bytes` 复算，不依赖任何真实服务。
 #
-# ```
+# ```text
 # 权重显存 = 参数量 × 每参数字节（fp16=2, int8=1, int4=0.5）
 # KV 显存 = 2 × layers × kv_heads × head_dim × 2 字节 × token 数
 # 可用 KV = 卡容量 × gpu_memory_utilization − 权重 − 框架/激活预留(约 2GB)
 # ```
 #
-# **关键陷阱**：量化只压缩权重，**不压缩 KV cache**（KV 默认仍是 fp16/bf16）。所以 int4 的 8B 在 24GB 卡上能跑，KV 空间主要来自「省下来的权重」。
+# **关键陷阱**：量化只压缩权重，**不压缩 KV cache**（KV 默认仍是 fp16/bf16）。
+# 所以 int4 的 8B 在 24GB 卡上能跑，KV 空间主要来自「省下来的权重」。
 
 # %%
 MODELS = {
@@ -321,15 +489,20 @@ ax.legend()
 save(fig, "ch10_kv_vs_util")
 
 # %% [markdown]
-# **读表**：
+# **读数**：
 #
-# - 8B 在 fp16 下：24GB 卡只剩约 3.2GB 给 KV（约 2.2 万 token、10 个 2048 上下文并发）；80GB 卡能到 36 万 token、177 个并发。这就是「同样模型换卡能多开 17 倍并发」的来源。
-# - 27B 在 fp16 下 54GB 权重，24GB/48GB 直接放不下；int4 后 13.5GB，才能在 24GB 卡上跑，但 KV 只剩约 6GB（11 个并发）。
-# - `gpu_memory_utilization` 从 0.80 调到 0.95，8B 的 KV 容量涨约 25%；再往上就会被 CUDA graph、激活和碎片吃掉——**0.90 是常用折中，0.95 以上只在确认无峰值时用**。
+# - 8B 在 fp16 下：24GB 卡只剩约 3.2GB 给 KV（约 2.2 万 token、10 个 2048 上下文并发）；
+#   80GB 卡能到 36 万 token、177 个并发。这就是「同样模型换卡能多开 17 倍并发」的来源。
+# - 27B 在 fp16 下 54GB 权重，24GB/48GB 直接放不下；int4 后 13.5GB，才能在 24GB 卡上跑，
+#   但 KV 只剩约 6GB（11 个并发）。
+# - `gpu_memory_utilization` 从 0.80 调到 0.95，8B 的 KV 容量涨约 25%；再往上就会被 CUDA graph、
+#   激活和碎片吃掉——**0.90 是常用折中，0.95 以上只在确认无峰值时用**。
+
+# %% [markdown]
+# ### 实验 C · 成本估算：每百万输出 token 多少钱
 #
-# ### 成本估算：每百万输出 token 多少钱
-#
-# 用 11 章 fixture 的回放吞吐做量级估算（8B 在 4090/A100/H100 上分别为 420/812/1350 tok/s；27B 按参数量线性外推）。**价格是示例价，下单前以平台页面为准。**
+# 协议：用第 11 章 fixture 的回放吞吐做量级估算（8B 在 4090/A100/H100 上分别为 420/812/1350 tok/s；
+# 27B 按参数量线性外推）。**价格是示例价，下单前以平台页面为准。**
 
 # %%
 CARD_PRICE = {"4090 24GB": 0.69, "A100 80GB": 1.99, "H100 80GB": 2.99}   # USD/小时（示例）
@@ -344,21 +517,21 @@ df_cost = pd.DataFrame(rows)
 df_cost
 
 # %% [markdown]
-# 结论：**每 token 成本 ≈ 小时价 ÷ (吞吐 × 3600)**。4090 单卡单价低、但吞吐也低，算下来不一定比 A100 贵；真正决定成本的是「你的并发能不能把卡喂饱」——这正是第 11 章压测要回答的问题。
+# **读数**：**每 token 成本 ≈ 小时价 ÷ (吞吐 × 3600)**。4090 单卡单价低、但吞吐也低，
+# 算下来不一定比 A100 贵；真正决定成本的是「你的并发能不能把卡喂饱」——这正是第 11 章压测要回答的问题。
 
 # %% [markdown]
-# ## 10.4 对照工业实现（vLLM 0.28.x）
+# ## 10.5 对照工业实现（vLLM 0.28.x）
 #
-# ### 接口契约表
+# ### 映射表：我们的客户端 / 服务端 vs vLLM 实现
 #
-# | Endpoint | 关键请求字段 | 关键响应字段 | vLLM 实现（0.28.x） |
-# | --- | --- | --- | --- |
-# | `POST /v1/chat/completions` | `model` `messages` `max_tokens` `temperature` `stream` `tools` `tool_choice` `response_format` `stop` | `choices[].message`、`finish_reason`、`usage` | `vllm/entrypoints/openai/api_server.py` + `serving_chat.py` |
-# | `POST /v1/completions` | `model` `prompt` `max_tokens` `n` `stream` | `choices[].text`、`usage` | 同目录 `serving_completion.py` |
-# | `POST /v1/embeddings` | `model` `input` `encoding_format` | `data[].embedding`、`usage` | `serving_embedding.py`；需 `--task embed`（`--runner pooling`，版本待核对） |
-# | `GET /v1/models` | — | 已加载模型与 LoRA 适配器列表 | `serving_models.py`（待核对） |
-# | `GET /health` | — | 200 = 就绪 | 用于客户端探测/负载均衡 |
-# | `GET /metrics` | — | Prometheus 指标（`vllm:*`） | 第 11 章的瓶颈判定靠它 |
+# | 我们的实现 | vLLM 对应物 | 真实文件（0.28.x） |
+# | --- | --- | --- |
+# | `_post_stream` 的 SSE 解析 | API Server 流式返回 | `vllm/entrypoints/openai/api_server.py` + `serving_chat.py` |
+# | `VLLMClient.chat` | `POST /v1/chat/completions` | 同目录 `serving_chat.py` |
+# | `VLLMClient.embed` | `POST /v1/embeddings` | `serving_embedding.py`（需 `--task embed`，待核对） |
+# | `/health` 探测 | 健康检查端点 | `api_server.py` 的 `/health` |
+# | fixture 回放 | `vllm bench serve --save-result` 的产物 | `vllm/benchmarks/serve.py`（路径待核对） |
 
 # %% [markdown]
 # ### 高级能力的开关与请求形状
@@ -371,19 +544,23 @@ df_cost
 # | 引导解码（legacy） | 同上 | 请求里带 `guided_json` / `guided_regex` 等扩展字段 | 同上 |
 # | 工具调用 | `--enable-auto-tool-choice --tool-call-parser hermes` | `tools=[...]`、`tool_choice="auto"` | `choices[].message.tool_calls[]`，`finish_reason="tool_calls"` |
 #
-# 注意：`--tool-call-parser` 必须与模型训练时的工具格式匹配（Qwen 常用 `hermes`，Llama 常用 `llama3_json`）。选错不会报错，只会退化成普通文本。
+# 注意：`--tool-call-parser` 必须与模型训练时的工具格式匹配（Qwen 常用 `hermes`，Llama 常用 `llama3_json`）。
+# 选错不会报错，只会退化成普通文本。
 
 # %% [markdown]
 # ### 差距在哪：兼容层不是「加个路由」
 #
-# 一个能上生产的 OpenAI 兼容层还要处理：流式背压与客户端断连、`usage` 的精确统计（含缓存命中 token）、错误码映射（400/422/429/503）、多模态输入、tokenizer 差异、请求取消（`abort`）、API Key 鉴权与限流。这些在 vLLM 里散落在 `vllm/entrypoints/openai/` 与 `vllm/v1/engine/` 中，也是「自己写个 FastAPI 包一层」和工业实现的主要差距。
+# 一个能上生产的 OpenAI 兼容层还要处理：流式背压与客户端断连、`usage` 的精确统计（含缓存命中 token）、
+# 错误码映射（400/422/429/503）、多模态输入、tokenizer 差异、请求取消（`abort`）、API Key 鉴权与限流。
+# 这些在 vLLM 里散落在 `vllm/entrypoints/openai/` 与 `vllm/v1/engine/` 中，也是
+# 「自己写个 FastAPI 包一层」和工业实现的主要差距。
 
 # %% [markdown]
-# ## 10.5 练习与小结
+# ## 10.6 练习与小结
 #
 # **练习**（⭐ 改参数 / ⭐⭐ 改实现 / ⭐⭐⭐ 开放设计）
 #
-# 1. ⭐ 把 `--max-model-len` 从 8192 改成 4096，重跑 `df_mem`/`df_util` 的 KV 计算。并发数为什么不是翻倍？提示：`--max-model-len` 影响的是单请求上限，不是块总数。
+# 1. ⭐ 把 `--max-model-len` 从 8192 改成 4096，重跑 10.4 实验 B 的 KV 计算。并发数为什么不是翻倍？提示：`--max-model-len` 影响的是单请求上限，不是块总数。
 # 2. ⭐ 用 `--gpu-memory-utilization 0.95` 起服务，再压 32 并发；观察是否 OOM 或吞吐下降。解释 0.95 为什么比 0.90 危险。
 # 3. ⭐⭐ 给 `VLLMClient` 加 `completion()`（`/v1/completions`）与 `list_models()`，用 fixture 回放验证；再在真服务上各打一条。
 # 4. ⭐⭐ 写一个 `load_lora_adapter(client, name, path)`：启动时 `--enable-lora`，运行中动态加载，然后对比「基座 / 适配器」对同一 prompt 的输出与 TTFT。
@@ -397,7 +574,8 @@ df_cost
 #
 # **小结与下一章**
 #
-# 到这里服务已经能接真实流量了。但「能跑」不等于「跑得好」：并发加到哪里开始亏、TTFT 和 TPOT 谁先崩、瓶颈在算力还是 KV——下一章用压测和决策树回答。
+# 到这里服务已经能接真实流量了。但「能跑」不等于「跑得好」：并发加到哪里开始亏、
+# TTFT 和 TPOT 谁先崩、瓶颈在算力还是 KV——下一章用压测和决策树回答。
 
 # %% [markdown]
 # **延伸阅读**

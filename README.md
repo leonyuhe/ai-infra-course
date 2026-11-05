@@ -89,6 +89,7 @@ make execute     # 无头执行全部 15 章（约 40 秒）
 ## 仓库结构
 
 ```
+CHAPTER_PATTERN.md  统一的章节写作模式（目标→设计→分步→实验）
 aiinfra/            共享库：TinyGPT（含 KV cache 接口）、bench、plotting
 notebooks/          章节源文件 .py（percent 格式）+ 构建产物 .ipynb
 assets/figures/     手绘 SVG 概念图（17 张，全英文图内文字）

@@ -57,7 +57,7 @@ MODEL=Qwen/Qwen3-8B TP_LIST="1 2 4" HOURS=2 bash cloud/scripts/12_tp_bench.sh
 # ④ 第 13 章：LoRA 训练 → merge → 双路线部署（需要 JSONL 数据）
 DATA_FILE=$HOME/data/kb_qa_train.jsonl MAX_STEPS=200 HOURS=1 \
   bash cloud/scripts/13_lora_finetune.sh
-# ⑤ 第 14 章：把 ③④ 的实测值填回 notebook 14.2 的 plan_capacity（见 §5）
+# ⑤ 第 14 章：把 ③④ 的实测值填回 notebook 14.3 Step 2 的 plan_capacity（见 §5）
 # ⑥ 拉回结果、关机（见 §6 与本文件末尾 checklist）
 ```
 
@@ -69,7 +69,7 @@ DATA_FILE=$HOME/data/kb_qa_train.jsonl MAX_STEPS=200 HOURS=1 \
 `vllm serve --tensor-parallel-size N`，再用 `vllm bench serve` 打同一份 2K/256 随机负载，
 最后输出 markdown 对比表（`output_throughput`、TTFT、TPOT 的 mean/p99、完成请求数）。
 
-**核对清单（与 notebook 12.3 的模拟结论对照）：**
+**核对清单（与 notebook 12.4 实验 C 的模拟结论对照）：**
 
 | 指标 | 预期现象（单机 NVLink，A100/H100） | 不符合时先查 |
 | --- | --- | --- |
@@ -78,7 +78,7 @@ DATA_FILE=$HOME/data/kb_qa_train.jsonl MAX_STEPS=200 HOURS=1 \
 | mean TPOT | 改善但边际递减；TP=4 通常好于 TP=2 | KV cache 是否吃满、是否触发抢占 |
 | p99 TPOT | 明显高于 mean 说明有排队/抢占 | 降 `--max-num-seqs` 或加实例 |
 
-> 结论落点：**TP=8 在 NVLink 上扩展效率约 0.89；换到以太网会掉到约 0.50**（notebook 12.3 模型）。
+> 结论落点：**TP=8 在 NVLink 上扩展效率约 0.89；换到以太网会掉到约 0.50**（notebook 12.4 实验 C 模型）。
 > 云上实测如果 TP=4 效率 < 0.8，不要急着加卡——先看是不是 batch 太小、或卡不在同一 NVLink 域。
 
 ---
@@ -88,7 +88,7 @@ DATA_FILE=$HOME/data/kb_qa_train.jsonl MAX_STEPS=200 HOURS=1 \
 脚本：[`scripts/13_lora_finetune.sh`](scripts/13_lora_finetune.sh)。四步：训练 → 验证冻结 →
 合并 → vLLM 双路线（合并权重 / `--enable-lora` 热插拔）。
 
-**核对清单（与 notebook 13.3 的本地闭环对照）：**
+**核对清单（与 notebook 13.4 实验 C 的本地闭环对照）：**
 
 | 检查点 | 预期 | 不符合时先查 |
 | --- | --- | --- |
@@ -118,7 +118,7 @@ DATA_FILE=$HOME/data/kb_qa_train.jsonl MAX_STEPS=200 HOURS=1 \
 **复算示例**（把 12 章 TP=1 的实测 `output_throughput ≈ 4000 tok/s` 填回方案 A）：
 
 ```python
-# notebook 14.2 的 plan_capacity 里，把 qps_per_instance 换成实测：
+# notebook 14.3 Step 2 的 plan_capacity 里，把 qps_per_instance 换成实测：
 measured_qps = 4000 / 300            # 输出 300 token/请求 → 13.3 req/s
 instances = ceil(100 / (measured_qps * 0.8))   # → 10 台，而不是估算的 8 台
 ```

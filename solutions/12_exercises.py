@@ -1,7 +1,7 @@
 """第 12 章《多卡并行》练习参考答案。
 
 运行：.venv/bin/python solutions/12_exercises.py
-说明：答案里的数字与 notebook 12.3 的模型同源（8B、fp16、A100 80G、decode batch=1），
+说明：答案里的数字与 notebook 12.4 实验 C 的模型同源（8B、fp16、A100 80G、decode batch=1），
       换机器/换模型时重算即可；结论（趋势）比绝对值重要。
 """
 

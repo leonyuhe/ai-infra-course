@@ -108,7 +108,7 @@ for tp, thr, ttft, p99t, tpot, p99p, done in rows:
     print(f"| {tp} | {thr:.1f} | {eff:.2f} | {ttft:.1f} | {p99t:.1f} | {tpot:.2f} | {p99p:.2f} | {done} |")
 PY
 
-log "预期现象（对照 12.3 的模拟结论）"
+log "预期现象（对照 12.4 实验 C 的模拟结论）"
 cat <<'TXT'
 - TP=2/4 的 output tok/s 通常接近线性，扩展效率 0.85–0.95（NVLink 域内）。
 - TP 越高，mean TTFT 通常越低（prefill 被切开），但 TPOT 的改善会变缓。

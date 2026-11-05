@@ -1,60 +1,152 @@
 # %% [markdown]
 # # 第 09 章 · vLLM 架构与源码地图
 #
-# > 02–06 章我们手写了 KV cache、分页、前缀缓存、调度器和 chunked prefill；这一章把这些零件装回工业实现，回答「它们到底放在哪、怎么连起来、我们少写了什么」。
+# > 前六章我们手写了推理引擎的每个零件；这一章把它们装回工业实现，回答「它们放在哪、怎么连起来、我们少写了什么」。
 #
 # | 项目 | 内容 |
 # | --- | --- |
-# | 预计用时 | 60–75 分钟 |
+# | 预计用时 | 75–90 分钟 |
 # | 运行环境 | 🏠 Mac（CPU/MPS）· 无需 GPU、无需安装 vLLM |
 # | 前置章节 | 02–06（KV cache / PagedAttention / 前缀缓存 / 调度器 / chunked prefill） |
-# | 锁定版本 | vLLM 0.28.x（v1 引擎）；源码路径按 v1 目录结构整理，不确定处标「待核对版本」 |
-# | 本章产物 | 分层架构图、请求生命周期、逐项对照表、源码地图、vLLM 默认参数下的调度模拟 |
+# | 本章产物 | 分层架构图、请求生命周期、可运行的调度模拟器、四组对比实验、源码地图 |
+# | 本章接口 | 模拟器变量名与 vLLM 对齐（`max_num_seqs`、`max_num_batched_tokens`）；不依赖 `vllm` 包 |
 #
 # **学完你能回答：**
 # 1. 一个 HTTP 请求从进来到吐出 token 经过哪几层？层与层之间传的是什么对象？
-# 2. `Scheduler`、`KVCacheManager`、`BlockPool`、`Executor`、`ModelRunner` 各自负责什么，边界在哪？
-# 3. 我们 02–06 章写的 200 行，对应 vLLM 里的哪些文件？差距是「多写了什么」？
+# 2. `Scheduler`、`KVCacheManager`、`BlockPool`、`Executor`、`ModelRunner` 的边界在哪？
+# 3. 我们 02–06 章写的几百行，对应 vLLM 里的哪些文件？差距是「多写了什么」？
+# 4. 怎么用约 120 行模拟器验证 vLLM 的调度规则，而不需要真的装 vLLM？
 
 # %% [markdown]
-# ## 09.1 问题与直觉
+# ## 09.0 本章目标与路线
 #
-# 你在 05 章写过一个几十行的连续批处理调度器，跑得挺好。那为什么工业实现需要一层层拆开？因为教学版把三件难事藏起来了：
+# **一句话目标**：把 02–06 章手写的零件映射到 vLLM v1 的分层架构与真实源码位置，
+# 并用一个同构模拟器验证「vLLM 默认参数下的调度规则」；不改变任何已有实验结论。
 #
-# 1. **边界**：请求从哪来、到哪去——API 层、进程边界、流式返回、异常；
+# **代价与边界**：
+# - 本章不安装 vLLM、不下载模型；模拟器只复刻**决策逻辑**（谁进 batch、谁被抢占），不复刻 GPU 执行；
+# - 源码路径按 vLLM 0.28.x 的 v1 目录整理，离线无法确认的条目显式标「待核对版本」；
+# - 模拟数字用于解释趋势，不代表真实 GPU 吞吐（真实数字在第 11 章的压测里）。
+#
+# **本章交付物**：
+#
+# | # | 交付物 | 在哪一节 | 怎么验收 |
+# | --- | --- | --- | --- |
+# | 1 | 分层架构图 + 请求生命周期图 | 09.2 | 能指着图说出每一层传什么对象 |
+# | 2 | 约 120 行的 vLLM 同构模拟器 | 09.3 Step 1–4 | 四组实验的断言全过（请求全完成、块不超限） |
+# | 3 | 四种调度策略对比 | 09.4 实验 A | 吞吐 488 → 1634 tok/s，约 3.3 倍 |
+# | 4 | 调度轨迹与 `max_num_seqs` 扫描 | 09.4 实验 B/C | 读数与「prefill 贵、decode 摊薄」一致 |
+# | 5 | 逐项对照表 + 源码地图 + 调用链 | 09.5 | 每条路径都有核对状态与核对命令 |
+#
+# **阅读路线**：09.1 问题 → 09.2 高阶设计（先看两张图）→ 09.3 分四步实现（每步有验收）
+# → 09.4 实验 A/B/C → 09.5 源码地图终检 → 09.6 练习。
+
+# %% [markdown]
+# ## 09.1 问题与直觉：教学代码与生产引擎差在哪
+#
+# 05 章你写过一个几十行的连续批处理调度器，跑得挺好。那为什么工业实现要一层层拆开？
+# 因为教学版把三件难事藏起来了：
+#
+# 1. **边界**：请求从哪来、到哪去——HTTP 层、多进程、流式返回、异常与超时；
 # 2. **钱**：KV cache 的块必须被精确分配、复用、回收，块表还要交给 attention kernel；
 # 3. **规模**：256 个请求同时 decode 时，每步的 token 预算、抢占、采样都要可解释、可观测。
+#
+# 两张关键图（分层架构与请求生命周期）放在 09.2，先记住一个反例：
+#
+# **反例**：如果像静态批处理那样「凑满一批再跑、跑完再收」，并发里只要有一个长请求，
+# 就会把同批所有请求的 TTFT/TPOT 一起拖长。vLLM 的连续批处理每个 iteration 都重新决定「这一步带谁玩」。
+
+# %% [markdown]
+# | 维度 | 教学版（02–06 章） | 工业版 vLLM v1 |
+# | --- | --- | --- |
+# | 边界 | 一个 Python 进程内调用 | API Server + 独立 EngineCore 进程 + Executor/Worker |
+# | KV 管理 | 连续预分配 / 手写 block manager | `KVCacheManager` + `BlockPool` + 前缀缓存 + 多 attention 后端 |
+# | 调度 | 一个 while 循环 | `Scheduler`：队列、token 预算、抢占、结构化输出约束 |
+# | 可观测 | `print` | Prometheus 指标 + 请求日志 + `vllm bench serve` |
+#
+# 本章要解决的两个子问题：
+#
+# - **正确性**：vLLM 的调度规则（预算 / 准入 / 抢占）能不能用 100 行复刻，且行为一致？
+# - **成本**：这些规则分别影响吞吐、TTFT、p99 的哪一部分？
+#
+# 一句话记住：**vLLM = 分页 KV cache（02–04 章）+ 每步重排的调度器（05–06 章）+ 把它们包成 OpenAI API 的工程外壳。**
+
+# %% [markdown]
+# ## 09.2 高阶设计：分层、生命周期与三个组件
 #
 # 先看整体分层：左边是数据流，右边是每一层的源码位置。
 #
 # ![](../assets/figures/ch09_architecture.svg)
 #
-# 再看一个请求的一生：admission 决定它何时进来，prefill 决定 TTFT，decode 决定 TPOT，finish/preempt 决定它会不会被踢出去重算。
+# 再看一个请求的一生：admission 决定它何时进来，prefill 决定 TTFT，decode 决定 TPOT，
+# finish/preempt 决定它会不会被踢出去重算。
 #
 # ![](../assets/figures/ch09_lifecycle.svg)
-#
-# **反例**：如果像静态批处理那样「凑满一批再跑、跑完再收」，并发里只要有一个长请求，就会把同批所有请求的 TTFT/TPOT 一起拖长。vLLM 的连续批处理每个 iteration 都重新决定「这一步带谁玩」。
-#
-# 一句话记住：**vLLM = 分页 KV cache（02–04 章）+ 每步重排的调度器（05–06 章）+ 把它们包成 OpenAI API 的工程外壳。**
 
 # %% [markdown]
-# ## 09.2 从零实现：一个 vLLM 同构的调度模拟器
+# 动手前先把结构定下来。整章只有一个模拟对象和三个组件。
 #
-# 本节不抄源码，而是用 120 行复刻调度器的**决策逻辑**，变量名与 vLLM 对齐（`max_num_seqs`、`max_num_batched_tokens`、`prefill_left`、`preempt`）。09.3 用它跑出 vLLM 默认参数下的轨迹。
+# **组件 1：请求与预算（存什么）**
+# `Req` 记录 prompt 长度、已生成 token、已占块数、到达时刻；`SimConfig` 记录 vLLM 的两个关键预算：
+# `max_num_seqs`（同时跑多少请求）与 `max_num_batched_tokens`（一步最多算多少 token）。
 #
-# | 概念 | 本实验里的名字 | vLLM v1 中的位置 |
+# **组件 2：块池（钱在哪）**
+# `BlockPool` 按 `block_size=16` 记账：`ensure()` 检查能否为新 token 开出块，`release()` 把块还回池子。
+# 它对应 `vllm/v1/core/block_pool.py`，不碰真实显存，只维护「谁占了多少块」。
+#
+# **组件 3：调度器（谁先跑）**
+# 每个 iteration 做三件事：
+# 1. 先喂 running 请求：decode 发 1 个 token，未完成的 prefill 发剩余 chunk；
+# 2. 再按 token 预算和 `max_num_seqs` 从 waiting 收新请求；
+# 3. 块不够时抢占「最近被调度」的请求，释放块并让它 recompute。
+#
+# 数据流：
+#
+# ```text
+# arrivals → waiting 队列 → Scheduler.schedule() → SchedulerOutput → 执行 → token / 完成 / 抢占
+#                               ↑ 关键：每步都重排，而不是一批跑到底
+# ```
+
+# %% [markdown]
+# ### 接口契约
+#
+# | 模拟器里的名字 | 语义 | vLLM v1 对应物 |
 # | --- | --- | --- |
-# | 请求 | `Req` | `vllm/v1/request.py` 的 `Request` |
-# | 每步 token 预算 | `max_num_batched_tokens` | `Scheduler` 构造参数 |
-# | 同时运行请求上限 | `max_num_seqs` | `Scheduler` 构造参数 |
-# | 物理块池 | `BlockPool` | `vllm/v1/core/block_pool.py` |
-# | 一步的调度结果 | `scheduled` 列表 | `SchedulerOutput` |
-# | 抢占 | `preempted` 集合 | `Scheduler` 内部的抢占逻辑（方法名待核对版本） |
+# | `Req` / `SimConfig` | 请求状态 + 调度参数 | `vllm/v1/request.py` 的 `Request`、`Scheduler` 构造参数 |
+# | `BlockPool.ensure/release` | 块分配与回收 | `vllm/v1/core/block_pool.py` |
+# | `schedule_step()` | 一步的调度决策 | `Scheduler.schedule()`（`vllm/v1/core/sched/scheduler.py`） |
+# | `step_cost()` | 一步的耗时模型 | 真实 GPU 上 prefill/decode 的执行时间 |
+# | `apply_step()` | 写 KV、采样、回收 | `Executor.execute_model()` + `GPUModelRunner` |
+# | `preempted` | 本步被抢占的请求 | `Scheduler` 内部抢占逻辑（方法名待核对版本） |
 #
-# 规则先写死，读到后面再解释：
-# - 每个 iteration 先喂 running 请求（decode 发 1 个 token，prefill 发剩余 chunk），再收 waiting 请求；
-# - 请求需要新块而块池为空 → 抢占「最近被调度」的请求，释放块并让它 recompute；
-# - 一步耗时 = prefill token 数 × 单 token 成本 + decode 固定开销 + 每请求成本。
+# 为什么把 `schedule_step` 和 `apply_step` 分开？前者只做决策（可单测、可记录轨迹），
+# 后者改变状态（写 KV、生成 token、释放块）。vLLM 也是这个分界：`Scheduler` 产出
+# `SchedulerOutput`，`Worker` 才真正执行。
+#
+# ### 验收标准
+#
+# | 步骤 | 验收 |
+# | --- | --- |
+# | Step 1 数据结构 | 80 个请求都满足 `prefill_left == prompt_len` |
+# | Step 2 块池 | `ensure` 失败时不占块；`release` 后 `free + used == total` |
+# | Step 3 调度 | 每步 token 总数 ≤ `max_num_batched_tokens`；running ≤ `max_num_seqs` |
+# | Step 4 模拟 | 所有请求都完成；峰值块 ≤ 块池容量；KV 不足时抢占次数 > 0 |
+# | 实验 A/B/C | 四策略吞吐排序正确；轨迹第 7 步后进入纯 decode；sweep 单调 |
+
+# %% [markdown]
+# ## 09.3 从零实现：分四步
+#
+# 不抄源码，用约 120 行复刻 vLLM 调度器的决策逻辑，变量名与源码对齐。每步先讲目标和做法，
+# 再给代码，最后给验收。
+#
+# | Step | 做什么 | 代码 |
+# | --- | --- | --- |
+# | 1 | 定义请求、配置与可复现负载 | `Req` / `SimConfig` / `make_workload` |
+# | 2 | 写块池：分配、回收、峰值统计 | `BlockPool` |
+# | 3 | 写一步调度：running 优先、预算、抢占 | `schedule_step` / `step_cost` / `apply_step` |
+# | 4 | 推进时间轴并写对照基线 | `simulate` / `static_batch` / `summarize` |
+#
+# 先做环境准备：引入依赖、固定 seed，并确认概念图存在。
 
 # %%
 import math
@@ -63,6 +155,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -77,6 +170,15 @@ ROOT = Path.cwd().parent
 FIG = ROOT / "assets" / "figures"
 print("repo root:", ROOT)
 assert (FIG / "ch09_architecture.svg").exists(), "概念图缺失"
+
+# %% [markdown]
+# ### Step 1 · 数据结构与负载
+#
+# 目标：把「请求」和「调度参数」变成可迭代的对象，并造一份可复现的负载
+# （80 请求、平均 40 req/s 到达、prompt 128–1024、输出 32–128）。
+#
+# 做法：`Req` 的字段与 vLLM `Request` 对齐（`prefill_left`、`num_generated`、`blocks`）；
+# `SimConfig` 把调度参数与耗时模型放在一起，方便第 09.4 节做参数扫描。
 
 # %%
 @dataclass
@@ -125,6 +227,18 @@ print(f"{len(wl)} 个请求；prompt 均值 {np.mean([r.prompt_len for r in wl])
       f"到达跨度 {wl[-1].arrival:.0f} ms")
 assert all(r.prefill_left == r.prompt_len for r in wl)
 
+# %% [markdown]
+# **Step 1 验收**：80 个请求都满足 `prefill_left == prompt_len`；负载 prompt 均值约 608 token、
+# 到达跨度约 1.8 s（见上方打印），后续实验可复现。
+
+# %% [markdown]
+# ### Step 2 · 块池
+#
+# 目标：用「16 token 一块」的记账方式回答「这个请求还能不能再来一个 token」。
+#
+# 做法：`ensure` 只在块够时扣块，失败必须保证块数不变（否则调度器会误判）；
+# `release` 把块全部还回。`peak_used` 用于后面验证「峰值不超过容量」。
+
 # %%
 class BlockPool:
     """最小版 BlockPool：只记账、不碰真实显存；对应 vllm/v1/core/block_pool.py。"""
@@ -156,6 +270,19 @@ class BlockPool:
     @property
     def used(self) -> int:
         return self.total - self.free
+
+# %% [markdown]
+# **Step 2 验收**：`free + used == total` 恒成立；`ensure` 失败时不改变块数。
+# 后面实验 C 的 `peak_blocks <= total_blocks` 断言会再次覆盖这一点。
+
+# %% [markdown]
+# ### Step 3 · 一步调度
+#
+# 目标：复刻 `Scheduler.schedule()` 的两个阶段——先 running、再 waiting，并在块不足时抢占。
+#
+# 做法：`schedule_step` 只做决策，返回 `(请求, 本步 token 数)` 列表与被抢占集合；
+# `step_cost` 把「算多少 token」翻译成毫秒；`apply_step` 负责写 KV、采样、回收。
+# 三个函数各司其职，正好对应 vLLM 的 Scheduler / 时间模型 / Worker。
 
 # %%
 def schedule_step(cfg: SimConfig, pool: BlockPool, active: list, waiting: deque):
@@ -217,7 +344,6 @@ def apply_step(scheduled, active, pool, t, step_ms):
             done.append(r)
     return done
 
-
 # %%
 def simulate(cfg: SimConfig, workload: list[Req], total_blocks: int = 24000,
              trace: bool = False) -> dict:
@@ -248,6 +374,18 @@ def simulate(cfg: SimConfig, workload: list[Req], total_blocks: int = 24000,
                          "kv_blocks": pool.used, "preempts": preempts})
     return {"finished": done, "makespan": t, "preemptions": preempts,
             "steps": steps, "peak_blocks": pool.peak_used, "trace": rows}
+
+# %% [markdown]
+# **Step 3 验收**：每步 token 总数不超过 `max_num_batched_tokens`，running 不超过 `max_num_seqs`；
+# 被抢占的请求进入 `preempted` 集合，且不会在同一步被重新塞回 waiting。
+
+# %% [markdown]
+# ### Step 4 · 推进时间轴与对照基线
+#
+# 目标：把「一步」循环成「一次完整服务」，并补一个 05 章的静态批处理基线用于对照。
+#
+# 做法：`simulate` 只做推进与记录（可开关 trace）；`summarize` 统一计算吞吐、TTFT、
+# p50/p99 延迟，保证四种方案口径一致；`static_batch` 是「凑满一批、跑完再收」的反例。
 
 # %%
 def static_batch(workload: list[Req], batch_size: int = 8):
@@ -280,12 +418,31 @@ def summarize(result: dict, label: str) -> dict:
             "抢占次数": result["preemptions"], "KV峰值块": result["peak_blocks"]}
 
 # %% [markdown]
-# 模拟器就绪。注意 `schedule_step` 里的两段循环，就是 vLLM `Scheduler.schedule()` 的骨架：
-# 先处理 running（decode 与未完成的 prefill），再按 `max_num_seqs` 和 token 预算收 waiting。
+# **Step 4 验收**：`simulate` 的 `finished` 覆盖全部 80 个请求，`peak_blocks <= total_blocks`；
+# 模拟器与静态批处理基线共用 `summarize` 口径，四种方案可以直接比较。
+
+# %% [markdown]
+# ## 09.4 实测
 #
-# ## 09.3 实测：vLLM 默认参数 vs 我们手写的两种策略
+# 三个实验回答三个问题，全部基于 09.3 的模拟器（复刻调度决策，不是 GPU 执行）：
 #
-# 同一份负载（80 请求、40 req/s 到达）跑四种方案。前两种是 05/06 章的手写策略，后两种是 vLLM 默认参数在「KV 充足」与「KV 不足」两种机器上的表现。
+# | 实验 | 问题 | 产出 |
+# | --- | --- | --- |
+# | A | 四种调度策略差多少？ | 对比表 + 柱状图 |
+# | B | 一步里 prefill / decode / KV 怎么变？ | 调度轨迹表 |
+# | C | `max_num_seqs` 从 1 到 256，吞吐和尾延迟怎么走？ | 扫描表 + 双轴图 |
+#
+# 测量协议：负载 80 请求、平均 40 req/s 到达、固定 seed；时间模型
+# `step_ms = 0.04 × prefill_tokens + 8.0 + 0.12 × decode_requests`；
+# 调度决策开销用 `aiinfra.bench.bench(warmup=1, reps=5)` 在本机实测。
+# **绝对值是模拟量级，趋势才是结论。**
+
+# %% [markdown]
+# ### 实验 A · 四种调度策略
+#
+# 协议：同一份负载跑四种方案——静态批处理 b=8（05 章反例）、连续批处理 8/2048（05 章手写）、
+# vLLM 默认 256/8192 且 KV 充足（A100 80G ≈ 24k 块）、vLLM 默认但 KV 只剩 400 块。
+# 四种方案的指标都由 `summarize` 统一计算。
 
 # %%
 rows = []
@@ -307,11 +464,57 @@ df_compare["scheme_en"] = ["Static batch b=8", "Continuous 8/2048",
                            "vLLM defaults 256/8192", "vLLM defaults, KV short"]
 df_compare
 
+# %% [markdown]
+# 把吞吐画成柱状图，差距更直观：
+
+# %%
+x_names = df_compare["scheme_en"].tolist()
+tok_cmp = df_compare["吞吐(tok/s)"].to_numpy()
+fig, ax = plt.subplots()
+colors = ["#9CA3AF", "#7C3AED", "#2563EB", "#EF4444"]
+ax.bar(x_names, tok_cmp, color=colors)
+ax.set_ylabel("Throughput (tok/s)")
+ax.set_title("Same workload, four strategies: the gap is how many requests run at once")
+ax.tick_params(axis="x", rotation=10)
+save(fig, "ch09_policy_compare")
+
+# %% [markdown]
+# **读数**：
+#
+# - **方案对比**：静态批处理 488 tok/s → 连续批处理 677 → vLLM 默认 1634，约 **3.3 倍**；
+#   KV 不足时掉回 641，并出现 21 次抢占。
+# - **原因**：decode 一步成本 ≈ `固定开销 + 每请求成本 × 并发数`。并发上不去就摊不薄固定开销；
+#   而并发被 `max_num_seqs` 和 **KV 块数**双重限制。
+# - **TTFT 1222 ms 不是 bug**：这份负载 prompt 均值 608、到达率 40 req/s，prefill 需求约
+#   2.4 万 token/s，已经贴着模拟器的 prefill 容量（8192 / 335 ms ≈ 2.4 万 token/s）。
+#   第 11 章的瓶颈判定就从这类现象开始。
+
+# %% [markdown]
+# ### 实验 B · 调度轨迹：一步里发生了什么
+#
+# 协议：用 vLLM 默认参数跑同一负载，记录前 12 步的 running / waiting / prefill token /
+# decode 请求数 / 单步耗时 / KV 块数 / 抢占次数。
+#
+# 读数看三件事：prefill 与 decode 是否混批、每步时间由谁主导、KV 何时达到峰值。
+
 # %%
 res_trace = simulate(CFG_VLLM, make_workload(), total_blocks=24000, trace=True)
 trace_df = pd.DataFrame(res_trace["trace"])
 print(f"总迭代 {len(trace_df)} 步；KV 峰值 {res_trace['peak_blocks']} 块")
 trace_df.head(12)
+
+# %% [markdown]
+# **读数**：前 6 步把 8192 token 预算几乎全花在 prefill 上，单步 300–340 ms；第 7 步后进入纯 decode，
+# 一步 17.6 ms ≈ `8.0 + 0.12 × 80`。这就是「prefill 贵、decode 按并发摊薄」的量化版本，
+# 也是 TTFT 和 TPOT 由不同阶段决定的直接证据。
+
+# %% [markdown]
+# ### 实验 C · `max_num_seqs` 扫描与调度开销
+#
+# 协议：固定 token 预算 8192、KV 充足，只改 `max_num_seqs`（1/2/4/8/16/32/64/128/256），
+# 每个点跑完整模拟；再用 `bench` 实测 80 请求模拟的调度决策总耗时。
+#
+# 先看断言与调度开销——它是「调度器很便宜，贵的永远是前向和 KV 搬运」的证据：
 
 # %%
 assert len(res_vllm["finished"]) == 80, "所有请求都应完成"
@@ -322,12 +525,6 @@ assert df_compare.loc[3, "抢占次数"] > 0, "KV 不足时应发生抢占"
 overhead = bench(lambda: simulate(CFG_VLLM, make_workload(), 24000),
                  name="simulate(80 reqs)", warmup=1, reps=5)
 pd.DataFrame([overhead.as_dict()])
-
-# %% [markdown]
-# 上表最后一列是**在本机测得的**调度决策总耗时（纯 Python，含 80 个请求的完整模拟）。
-# 它比一步 GPU 前向（毫秒级）还小两个数量级——这说明「调度器本身很便宜，贵的永远是模型前向和 KV 搬运」。
-#
-# 下面扫一遍 `max_num_seqs`：固定 token 预算 8192、KV 充足，只改同时运行的请求数上限。
 
 # %%
 rows = []
@@ -341,8 +538,6 @@ sweep_df = pd.DataFrame(rows)
 sweep_df[["max_num_seqs", "吞吐(tok/s)", "TTFT_p50_ms", "延迟_p50_ms", "延迟_p99_ms", "KV峰值块"]]
 
 # %%
-import matplotlib.pyplot as plt
-
 x_seqs = sweep_df["max_num_seqs"].to_numpy()
 tok_s = sweep_df["吞吐(tok/s)"].to_numpy()
 p99_ms = sweep_df["延迟_p99_ms"].to_numpy()
@@ -361,30 +556,24 @@ h2, l2 = ax2.get_legend_handles_labels()
 ax1.legend(h1 + h2, l1 + l2, loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=2, frameon=False)
 save(fig, "ch09_scheduler_sweep")
 
-# %%
-x_names = df_compare["scheme_en"].tolist()
-tok_cmp = df_compare["吞吐(tok/s)"].to_numpy()
-fig, ax = plt.subplots()
-colors = ["#9CA3AF", "#7C3AED", "#2563EB", "#EF4444"]
-ax.bar(x_names, tok_cmp, color=colors)
-ax.set_ylabel("Throughput (tok/s)")
-ax.set_title("Same workload, four strategies: the gap is how many requests run at once")
-ax.tick_params(axis="x", rotation=10)
-save(fig, "ch09_policy_compare")
+# %% [markdown]
+# **读数**：
+#
+# - **调度开销**：本机实测 80 请求的完整模拟约 2 ms（纯 Python），比一步 GPU 前向（毫秒级）
+#   还小两个数量级——调度本身不是瓶颈。
+# - **`max_num_seqs` 扫描**：吞吐从 120 涨到 1660 tok/s；64 之后并发翻倍只涨 5.5%，随后完全持平。
+#   注意这份负载只有 80 个请求，128 已能把它们全部并发，**末尾的持平是负载上限而非硬件上限**；
+#   真实的硬件拐点要用持续的到达流压测（第 11 章）。p99 在欠载下先降后平，过载时才会随并发上升。
+#   真正的容量天花板是 KV：见实验 A 的「KV 不足」那一行。
+#
+# **对 vLLM 参数的启示**：`max_num_seqs` 是吞吐旋钮，但不是越大越好；先确认 KV 够
+# （`gpu_memory_utilization`、`max_model_len`），再按 SLO 的 p99 反推并发上限。
 
 # %% [markdown]
-# **读图**：
+# ## 09.5 对照工业实现（vLLM 0.28.x）
 #
-# - **调度轨迹**（`trace_df`）：前 6 步把 8192 token 预算几乎全花在 prefill 上，单步 300–340 ms；第 7 步后进入纯 decode，一步 17.6 ms ≈ `8.0 + 0.12 × 80`。这就是「prefill 贵、decode 按并发摊薄」的量化版本。
-# - **方案对比**：静态批处理 488 tok/s → 连续批处理 677 → vLLM 默认 1634，约 **3.3 倍**；KV 不足时掉回 641，并出现 21 次抢占。
-# - **原因**：decode 一步成本 ≈ `固定开销 + 每请求成本 × 并发数`。并发上不去就摊不薄固定开销；而并发被 `max_num_seqs` 和 **KV 块数**双重限制。
-# - **TTFT 1222 ms 不是 bug**：这份负载 prompt 均值 608、到达率 40 req/s，prefill 需求约 2.4 万 token/s，已经贴着模拟器的 prefill 容量（8192 / 335 ms ≈ 2.4 万 token/s）。第 11 章的瓶颈判定就从这类现象开始。
-# - **max_num_seqs 扫描**：吞吐从 120 涨到 1660 tok/s；64 之后并发翻倍只涨 5.5%，随后完全持平。注意这份负载只有 80 个请求，128 已能把它们全部并发，**末尾的持平是负载上限而非硬件上限**；真实的硬件拐点要用持续的到达流压测（第 11 章）。p99 在欠载下先降后平，过载时才会随并发上升。真正的容量天花板是 KV：见「KV 不足」那一行。
-#
-# **对 vLLM 参数的启示**：`max_num_seqs` 是吞吐旋钮，但不是越大越好；先确认 KV 够（`gpu_memory_utilization`、`max_model_len`），再按 SLO 的 p99 反推并发上限。
-
-# %% [markdown]
-# ## 09.4 对照工业实现（vLLM 0.28.x）
+# 09.3 的模拟器只覆盖「决策」，这一节做**源码地图终检**：把我们的每个类映射到 vLLM v1 的真实文件，
+# 并给出离线也能执行的版本核对命令。
 #
 # ### 逐项对照：我们的类 vs vLLM 的类
 #
@@ -423,15 +612,14 @@ save(fig, "ch09_policy_compare")
 # 6. 采样出 token，`OutputProcessor` detokenize，按 SSE 流式返回；同时把新 token 写回请求状态；
 # 7. 请求结束（`finish_reason`）→ `KVCacheManager.free()` 归还块；若中途块不足 → 抢占 → recompute。
 #
-# 这 7 步就是 09.1 生命周期图里的箭头。想验证自己在读对版本，跑下面五条命令，比背路径可靠：
-
-# %% [markdown]
+# 这 7 步就是 09.2 生命周期图里的箭头。想验证自己在读对版本，跑下面五条命令，比背路径可靠：
+#
 # ```bash
 # python -c "import vllm; print(vllm.__version__)"            # 期望 0.28.x
 # python -c "from vllm.v1.core.sched.scheduler import Scheduler; print(Scheduler)"
 # python -c "from vllm.v1.core.kv_cache_manager import KVCacheManager; print(KVCacheManager)"
 # python -c "from vllm.v1.core.block_pool import BlockPool; print(BlockPool)"
-# find vllm/v1/engine -maxdepth 1 -name "*.py" | sort        # 对照 09.4 的目录表
+# find vllm/v1/engine -maxdepth 1 -name "*.py" | sort        # 对照 09.5 的目录表
 # ```
 #
 # 如果 0.28.x 的拆分与本章表格不一致，**以上面命令的输出为准**，把差异回填到表格；不要按记忆硬编码路径。
@@ -449,15 +637,15 @@ save(fig, "ch09_policy_compare")
 # 所以「读源码」的正确姿势不是从第一行读到最后一行，而是**带着一个现象，沿本章的调用链找到那 1–2 个文件**。
 
 # %% [markdown]
-# ## 09.5 练习与小结
+# ## 09.6 练习与小结
 #
 # **练习**（⭐ 改参数 / ⭐⭐ 改实现 / ⭐⭐⭐ 开放设计）
 #
-# 1. ⭐ 把 `CFG_VLLM.max_num_batched_tokens` 从 8192 改成 2048，重跑 09.3 的两张表。吞吐和 TTFT 各变多少？先用 token 预算解释，再跑一遍验证。
-# 2. ⭐ 把 `decode_ms_per_seq` 从 0.12 改成 0.02（模拟更快的卡），观察 sweep 的拐点位置向哪边移动。为什么？
+# 1. ⭐ 把 `CFG_VLLM.max_num_batched_tokens` 从 8192 改成 2048，重跑 09.4 实验 A 与实验 C 的表。吞吐和 TTFT 各变多少？先用 token 预算解释，再跑一遍验证。
+# 2. ⭐ 把 `decode_ms_per_seq` 从 0.12 改成 0.02（模拟更快的卡），观察 09.4 实验 C 的拐点位置向哪边移动。为什么？
 # 3. ⭐⭐ 给 `schedule_step` 加一个「优先级队列」：短 prompt 优先。在长 prompt 混短 prompt 的负载下比较 p50 / p99 延迟，并解释为什么吞吐基本不变。
 # 4. ⭐⭐ 把抢占从 recompute 改成 swap（把被抢请求的块「换出」而不是丢弃，稍后再换回），对比 `抢占次数 × prefill 成本` 与换入换出的搬运成本。需要给 `Req` 加字段。
-# 5. ⭐⭐⭐ 设计一条读码路线：线上现象是「首 token 很慢，但 TPOT 正常」。你会在 09.4 的哪几个文件加日志/下断点？给出验证步骤与预期证据。（评分要点：定位到 prefill/调度层、给出可观测指标、区分 KV 不足与排队的证据、有回滚方案）
+# 5. ⭐⭐⭐ 设计一条读码路线：线上现象是「首 token 很慢，但 TPOT 正常」。你会在 09.5 的哪几个文件加日志/下断点？给出验证步骤与预期证据。（评分要点：定位到 prefill/调度层、给出可观测指标、区分 KV 不足与排队的证据、有回滚方案）
 #
 # **你现在应该能回答：**
 #
@@ -467,7 +655,9 @@ save(fig, "ch09_policy_compare")
 #
 # **小结与下一章**
 #
-# 本章我们把 02–06 章的零件映射到了 vLLM 的真实文件与类名，并用一个同构模拟器验证了调度规则。下一章我们把服务真正跑起来（Mac 用 `vllm-metal`，云上用 Docker），用 OpenAI 兼容 API 发请求，看看这些内部对象在 HTTP 层长什么样。
+# 本章我们把 02–06 章的零件映射到了 vLLM 的真实文件与类名，并用一个同构模拟器验证了调度规则。
+# 下一章我们把服务真正跑起来（Mac 用 `vllm-metal`，云上用 Docker），用 OpenAI 兼容 API 发请求，
+# 看看这些内部对象在 HTTP 层长什么样。
 
 # %% [markdown]
 # **延伸阅读**

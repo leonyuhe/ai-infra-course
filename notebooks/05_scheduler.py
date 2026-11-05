@@ -1,66 +1,176 @@
 # %% [markdown]
 # # 第 05 章 · 调度器：静态批处理 vs 连续批处理
 #
-# > 同一张 GPU，换一个调度策略，吞吐能翻倍、尾延迟能降一个数量级。
-# > 这一章我们把「GPU 一步」抽象成成本模型，亲手写出两种调度器，并用它们跑出趋势。
+# > 同一块 GPU、同一串请求，换一种调度方式，吞吐为什么能翻倍、尾延迟为什么能差一个数量级。
 #
 # | 项目 | 内容 |
 # | --- | --- |
-# | 预计用时 | 75 分钟 |
-# | 运行环境 | 🏠 Mac（CPU/MPS）· 无需 GPU（调度器是模拟器） |
-# | 前置章节 | 02（KV cache 与 prefill/decode 两阶段）· 03（分页注意力） |
-# | 本章接口 | 定义 `Request`，供第 06 章复用 |
-# | 交付物 | 两种调度器 + 甘特图 + 吞吐/延迟曲线 + 参数扫描表 |
+# | 预计用时 | 90 分钟 |
+# | 运行环境 | 🏠 Mac（CPU/MPS）· 无需 GPU（调度器是模拟器）· torch 2.15 |
+# | 前置章节 | 02（prefill/decode 两阶段与瓶颈）· 03（分页注意力，理解 padding 可被消除） |
+# | 本章产物 | `Request` 接口、事件驱动模拟器、静态/连续两种调度器、甘特图、吞吐-延迟曲线、参数扫描表 |
+# | 本章接口 | `Request`（`prompt_len` / `max_new_tokens` / `arrival` / `num_computed` / `num_generated`），第 06 章直接复用 |
 #
 # **学完你能回答：**
-# 1. 连续批处理（continuous batching）到底比静态批处理多做了什么？
-# 2. 为什么 `max_num_seqs` 和 `max_num_batched_tokens` 一个管「同时几个请求」、一个管「一步算多少 token」？
-# 3. 静态批处理在真实对话负载下吞吐低，padding 和「等最长请求」各占多少责任？
+# 1. 连续批处理（continuous batching）比静态批处理多做了什么？
+# 2. 为什么 decode 单步耗时对 batch 亚线性？这一性质如何决定 batching 的收益？
+# 3. `max_num_seqs` 与 `max_num_batched_tokens` 分别限制什么？调小各自会先伤哪个指标？
+# 4. 静态批处理在真实对话负载下吞吐低，padding、等最长请求、批间空窗各占多少责任？
 
 # %% [markdown]
-# ## 05.1 问题与直觉
+# ## 05.0 本章目标与路线
 #
-# 先看一张图。上半图是**静态批处理**：攒一批请求，整批一起 prefill，然后一起 decode，直到这批里**最长**的那个结束，才接下一批。
-# 下半图是**连续批处理**（iteration-level scheduling，Orca 论文的核心思想）：每一个 decode step 结束，都检查有没有空出来的 slot，有空位就让新请求进来。
+# **一句话目标**：把「攒一批、整批跑完再换人」的静态批处理，换成「每个 decode step 都重新组批」的连续批处理；
+# 在同一到达序列、同样 `max_num_seqs=16` 下，吞吐从 310 提到 792 tokens/s（**2.55x**），TTFT p95 从 21.3s 降到 1.2s，
+# 并且不改变任何请求的输出内容。
+#
+# **代价与边界**：
+# - 调度器不省算力，它只让 GPU 的每个 slot 尽量不空转；代价是 decode 的 ITL 变差（29.3ms，而静态是 7.6ms）——
+#   这是第 06 章 chunked prefill 要还的债。
+# - 本章用**成本模型 + 事件驱动模拟器**而不是真机：要隔离「调度策略」这一个变量，真机的 kernel 与带宽噪声会把它淹没。
+# - 结论是趋势与相对倍数，绝对值随硬件变化；成本模型的两条假设会在实验 A 用本机 TinyGPT 实测验证。
+#
+# **本章交付四样东西**：
+#
+# | # | 交付物 | 在哪一节 | 怎么验收 |
+# | --- | --- | --- | --- |
+# | 1 | `Request` 数据结构 + 成本模型 | 05.3 Step 1–2 | 字段语义断言；模型两条假设断言 |
+# | 2 | 事件驱动模拟器与统一指标 | 05.3 Step 3 | 指标定义与表列一致；同一输入结果可复现 |
+# | 3 | 静态 / 连续两种调度器 | 05.3 Step 4–5 | 同到达同长度时两者结果相等；错峰时连续不慢于静态 |
+# | 4 | 三组实验：标定、对比、参数扫描 | 05.4 实验 A/B/C | 3 张图 + 5 张结果表，趋势与成本模型吻合 |
+#
+# **阅读路线**：05.1 问题与直觉 → 05.2 高阶设计 → 05.3 分步实现（6 步，每步有验收）→ 05.4 实验 A/B/C → 05.5 对照 vLLM → 05.6 练习。
+
+# %% [markdown]
+# ## 05.1 问题与直觉：同一块 GPU，两种时间轴
+#
+# 调度器不改变模型，只改变「GPU 下一步算什么」。所以它造成的差异全部写在时间轴上。
+# 先看同一到达序列在两种策略下的轨迹：
 #
 # ![](../assets/figures/ch05_gantt.svg)
 #
-# 图里有三处浪费，正是本章要量化的东西：
+# 上半图是**静态批处理**：攒一批请求，整批一起 prefill，然后一起 decode，直到这批里**最长**的那个结束，才接下一批。
+# 下半图是**连续批处理**（continuous batching，iteration-level scheduling，Orca 论文的核心思想）：
+# 每个 decode step 结束都重新检查一次 slot，一有空位就让新请求进来。
 #
-# - **padding**：一批请求的 prompt 长度不同，朴素实现要 pad 到最长那条再一起算，短 prompt 的算力白烧。
-# - **等最长请求**：8 个 token 就结束的请求，它的 slot 要空等 512 个 token 的邻居，GPU 仍在为邻居算，但短请求的 slot 是死的。
-# - **批间空窗**：整批没结束前，新到的请求只能排队；对话负载的输出长度是重尾的，这个空窗经常占掉一半时间。
+# 图里标出了三笔浪费，也是本章要量化的三件事：
 #
-# 反过来，连续批处理也不是免费的：新请求的 prefill 会插进 decode 的节奏里，让尾部 ITL 变差。
-# 第 06 章的 chunked prefill 就是来修这个问题的——本章先把问题测出来。
+# - **padding**：一批 prompt 长短不一，朴素实现要 pad 到最长再一起算，短 prompt 的算力白烧。
+# - **等最长请求**：只生成 8 个 token 的请求，slot 要空等到 512 个 token 的邻居结束；GPU 仍在为邻居算，但这个 slot 是死的。
+# - **批间空窗**：整批没结束前新请求进不来；对话负载的输出长度是重尾的，这个空窗会吃掉可观的 GPU 时间。
 
 # %% [markdown]
-# 为什么不做真机实验？因为本章要回答的是**调度策略**的因果，而不是某张卡的绝对性能。
-# 我们从 01/02 章知道：prefill 是算力受限（耗时 ∝ token 数），decode 是带宽受限（每步读一遍权重，但权重开销被 batch 摊薄，单步耗时增长远慢于 batch 大小）。
-# 于是把「GPU 一步」写成两行公式，就能跑出可信趋势，换任何模型只要改三个常数。
+# 关键概念对比：
 #
-# 成本模型参数（量级参照 A100 上的 7B 模型，单位为毫秒）：
-#
-# | 参数 | 含义 | 默认值 |
+# | 维度 | 静态批处理 | 连续批处理 |
 # | --- | --- | --- |
-# | `base_ms` | 一步的固定成本 ≈ 读一遍权重 | 6.0 |
-# | `prefill_per_token_ms` | 每 token 的 prefill 计算 | 0.08 |
-# | `decode_per_seq_ms` | 每序列的 decode 附加成本 | 0.12 |
-# | `prefill_launch_ms` | 多一次 prefill 的 kernel 发射 | 1.0 |
+# | 组批时机 | 整批跑完才重新组批 | 每个 iteration 边界都重新组批 |
+# | 新请求何时进入 | 下一批 | 有空 slot 的下一步 |
+# | prefill 方式 | 整批 pad 到最长 prompt 一起算 | 新请求单独 prefill，与 decode 混批 |
+# | 输出长度不一 | 全批等最长的那个 | 各自结束、立即释放 slot |
+# | 主要浪费 | padding + 槽位空转 + 批间空窗 | 几乎没有 slot 浪费 |
+# | 代价 | 吞吐低、排队久 | decode 被 prefill 顶住，ITL 尾部变差 |
 #
-# 三个指标先定义清楚，后面所有表都用同一口径：
+# 用一个具体反例感受差距：一批 16 个请求，输出长度从 8 到 1024 token 不等。
+# 静态批处理要跑满 1024 步 decode，前 1000 步里大部分 slot 已经空转；期间新到的请求只能排队。
+# 连续批处理在第 8 步就把短请求放走、把 slot 交给新请求，batch 始终接近满员。
 #
-# - **TTFT**：请求到达到第一个 token 产出（prefill 完的时刻）。
-# - **ITL / TPOT**：相邻两个输出 token 的间隔；我们在全量 token 上取 p95。
-# - **吞吐**：整个 trace 里产出的 token 数 ÷ makespan；**利用率**：活跃 slot 数 ÷ `max_num_seqs`，按时间加权。
+# **本章要解决的两个子问题**：
+#
+# 1. **吞吐**：同一到达序列、同一块 GPU，如何让 batch 尽量满？（答案：iteration-level scheduling）
+# 2. **代价**：换策略之后延迟怎么变？哪些指标变好、哪些变差？怎样用数字把这笔交易说清楚？
+#
+# **为什么用模拟器**：本章要回答的是调度策略的因果，不是某张卡的绝对性能。01/02 章已经确立两件事：
+# prefill 是算力受限（耗时 ∝ token 数），decode 是带宽受限（每步读一遍权重，权重开销被 batch 摊薄，单步耗时增长远慢于 batch）。
+# 于是把「GPU 一步」写成可配置的两行公式，就能隔离调度变量、跑出可信趋势；换任何模型只要改三个常数。
 
 # %% [markdown]
-# ## 05.2 从零实现
+# ## 05.2 高阶设计
 #
-# 先定接口。`Request` 的字段与 vLLM 的 `Request` 对齐：`prompt_len`、`max_new_tokens`、`arrival`。
-# 运行期我们只维护两个计数器：`num_computed`（KV cache 里已有的 context 长度）和 `num_generated`（已产出的 token 数）。
+# 动手前先把方案定下来。本章只有三个组件和一条数据流：`Request` 记录请求状态，成本模型把 GPU 一步抽象成耗时，
+# 调度器决定每一步把哪些请求拼成一批。
+#
+# **组件 1：Request（存什么）**
+#
+# 每个请求只有三个静态字段（`prompt_len`、`max_new_tokens`、`arrival`）和两个运行期计数器：
+# `num_computed`（KV 里已有的 context 长度）与 `num_generated`（已产出的 token 数）。
+# `t_first`、`t_done`、`token_times` 是给指标用的观测值。
+# `target_ctx()` 是贯穿全章的不变量：下一步 decode 之前，KV 里必须有多少 context token。
+#
+# **组件 2：成本模型（一步有多贵）**
+#
+# 把一次模型前向抽象成三项之和（单位 ms）：
+#
+# - 固定项 `base_ms`：一步读一遍权重；
+# - prefill 项：`prefill_per_token_ms × 本步 prefill 的 token 数`；
+# - decode 项：`decode_per_seq_ms × 本步 decode 的序列数`。
+#
+# 再加一笔 `prefill_launch_ms` 的发射成本。这个形状来自 01/02 章的 roofline：prefill 算力受限，所以对 token 线性；
+# decode 带宽受限，所以对 batch 亚线性——后面实验 A 会用 TinyGPT 实测验证后一条。
+
+# %% [markdown]
+# **组件 3：调度策略（谁决定下一步）**
+#
+# 两种策略共用同一套「批次执行」逻辑，差别只在组批时机：
+#
+# - **静态批处理**：GPU 空闲时取 `max_num_seqs` 个请求 → pad 后整批 prefill → 一起 decode 到最长结束 → 才组下一批。
+# - **连续批处理**：每个 iteration 先给 running 的请求各排 1 个 decode token，再用剩余 token 预算从 waiting 里接纳新请求；
+#   完成的请求当步释放 slot，下一步就能被新请求复用。
+#
+# **数据流**：
+#
+# ```text
+# 到达序列 → waiting 队列 → [组批] → 一步执行（prefill / decode）→ 更新 KV 计数与 token 时间
+#                               ↑                                        │
+#                               └──────── 完成的请求离开、slot 释放 ←────┘
+#
+# 执行过程同时记录：分段轨迹（画甘特图）+ 每步 batch 大小（算利用率）+ 每请求 token 时间（算 TTFT/ITL）
+# ```
+#
+# **指标口径**（全章统一，也是后面所有表的列）：
+#
+# - **TTFT**：请求到达到第一个 token 产出；**ITL / TPOT**：相邻输出 token 的间隔，取全量 token 的 p95；
+# - **吞吐**：trace 产出的 token 数 ÷ makespan；**GPU 空闲率**：没有请求在跑的时间占比；
+# - **batch 利用率**：活跃 slot 数 ÷ `max_num_seqs`，按步时长加权。
+
+# %% [markdown]
+# **接口契约**：
+#
+# | 接口 | 语义 | 谁用 |
+# | --- | --- | --- |
+# | `Request(prompt_len, max_new_tokens, arrival)` | 一个请求的静态信息 | 两种调度器 |
+# | `target_ctx()` / `prefill_need()` | 下一步前 KV 需要多长 / 还差多少 | 连续调度、第 06 章 chunked prefill |
+# | `run_static(reqs, cost, max_num_seqs)` | 静态批处理，返回指标 + 轨迹 | 实验 B |
+# | `run_continuous(reqs, cost, max_num_seqs, max_num_batched_tokens)` | 连续批处理，返回指标 + 轨迹 | 实验 B/C、第 06 章 |
+# | `Run.metrics / segments / steps` | 表与图的数据源 | 实验 B/C |
+#
+# **验收标准**（每一步都配一条可执行验收，写不出来说明没理解）：
+#
+# | 步骤 | 验收 |
+# | --- | --- |
+# | Step 1 Request | `target_ctx` / `needs_prefill` 的语义断言通过 |
+# | Step 2 成本模型 | decode 对 batch 亚线性、prefill 边际成本对 token 线性 |
+# | Step 3 模拟器与指标 | 指标定义与表列一致；`Run` 字段齐全 |
+# | Step 4 静态批处理 | 同构请求的 makespan == prefill + (max_new−1) × decode |
+# | Step 5 连续批处理 | 与静态在同到达同长度时结果相等；错峰时不比静态慢 |
+# | Step 6 整体验收 | 每个请求 token 数正确；中途到达的短请求 TTFT 至少好 2x |
+
+# %% [markdown]
+# ## 05.3 从零实现：分六步
+#
+# | Step | 做什么 | 代码 |
+# | --- | --- | --- |
+# | 1 | 定义 `Request`：静态字段 + 运行期计数 + 语义方法 | `Request` |
+# | 2 | 把 GPU 一步抽象成可配置耗时 | `CostModel` |
+# | 3 | 事件驱动模拟器的结果容器与统一指标 | `Run` / `summarize` |
+# | 4 | 静态批处理：整批 prefill、整批 decode 到最长 | `run_static` |
+# | 5 | 连续批处理：每个 iteration 重新组批 | `run_continuous` |
+# | 6 | 用断言验收两条路径的不变量 | 关键不变量断言 |
+#
+# 先准备依赖与设备：
 
 # %%
+
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,9 +194,19 @@ np.random.seed(0)
 print("device =", device)
 
 # %% [markdown]
-# ### 数据结构：`Request` 与成本模型
+# ### Step 1 · Request：一个请求需要记住什么
+#
+# 目标：把「请求从到达到结束」的状态压缩成几个计数字段，让调度器只依赖这些字段做决策。
+#
+# 做法：
+# - 静态字段（`prompt_len` / `max_new_tokens` / `arrival`）来自负载，运行期不改；
+# - `num_computed` 记录 KV 里已有的 context，`num_generated` 记录已产出的 token 数；
+# - `target_ctx()` 回答「下一步 decode 前 KV 必须有多长」，`prefill_need()` 回答「还差多少」。
+#
+# 验收：新请求必须需要 prefill；prefill 完成并产出第一个 token 后，应该可以直接 decode。
 
 # %%
+
 @dataclass
 class Request:
     """一个推理请求。字段命名与 vLLM 的 Request 对齐。"""
@@ -116,7 +236,27 @@ class Request:
         return self.target_ctx() - self.num_computed
 
 
+# 验收：fresh 请求需要 prefill；prefill 完成、产出第一个 token 后即可 decode
+r = Request(id=0, prompt_len=8, max_new_tokens=3, arrival=0.0)
+assert r.target_ctx() == 8 and r.prefill_need() == 8 and r.needs_prefill()
+r.num_computed, r.num_generated = 8, 1
+assert r.target_ctx() == 8 and r.prefill_need() == 0 and not r.needs_prefill()
+
+# %% [markdown]
+# 字段少带来一个好处：两种调度器、以及第 06 章的 chunked prefill 都只跟这 5 个字段打交道，接口保持稳定。
+
+# %% [markdown]
+# ### Step 2 · CostModel：把「GPU 一步」写成两行公式
+#
+# 目标：用三个常数把一步前向的耗时表达出来，既不依赖真实模型，又能复现 01/02 章的瓶颈结论。
+#
+# 做法：`step_ms(prefill_tokens, decode_seqs)` 把固定权重读取、prefill 计算、decode 附加计算相加；
+# prefill token 非零时再加一笔 kernel 发射成本。
+#
+# 验收：先把两条关键假设写成断言——decode 对 batch 亚线性，prefill 的边际成本对 token 线性。
+
 # %%
+
 @dataclass(frozen=True)
 class CostModel:
     """把「GPU 一步」抽象成可配置耗时（毫秒）。"""
@@ -141,12 +281,23 @@ assert abs(marginal - 1024 * cost.prefill_per_token_ms) < 1e-9  # prefill 的边
 print("decode b=1 / b=16 / b=32:", [round(cost.step_ms(0, b), 2) for b in (1, 16, 32)], "ms")
 
 # %% [markdown]
-# ### 一次模拟的结果容器
+# 两条断言通过，说明成本模型在数量关系上是对的：batch 从 1 到 32，decode 单步只从 6.12ms 涨到 9.84ms（1.6x），
+# 远小于 32x；而 prefill 每多 1024 个 token，耗时正好多 `1024 × 0.08 = 81.92ms`。
+# 这种「固定成本 + 线性增量」的形状，是后面所有吞吐结论的来源。
+
+# %% [markdown]
+# ### Step 3 · 模拟器骨架：结果容器与统一指标
 #
-# `Run` 里同时保留**给表格的指标**和**给甘特图的轨迹**：`segments` 是 `(slot, t0, t1, 类型)`，
-# 类型只有 `prefill` / `decode` 两种；`steps` 用来算利用率；`batch_info` 用来拆 padding 与 slot 浪费。
+# 目标：一次模拟要同时产出「给表格的指标」和「给图的轨迹」，并且指标口径只定义一次。
+#
+# 做法：
+# - `Run` 保存 4 类数据：`metrics`（表）、`segments`（甘特图）、`steps`（利用率）、`batch_info`（浪费拆解）；
+# - `summarize` 从请求的 `token_times` 与 `t_first/t_done` 计算 TTFT、ITL、E2E、吞吐、空闲率、利用率。
+#
+# 验收：后面 Step 4/5 的任何一次运行都能直接生成表与图，不需要再写第二套统计。
 
 # %%
+
 @dataclass
 class Run:
     metrics: dict
@@ -179,12 +330,16 @@ def summarize(name, reqs, segments, steps, makespan, max_num_seqs, batch_info) -
     return Run(metrics, reqs, segments, steps, makespan, batch_info)
 
 # %% [markdown]
-# ### 策略 A：静态批处理
+# ### Step 4 · 静态批处理：整批 prefill、整批 decode 到最长
 #
-# 逻辑只有三段：GPU 空闲时从等待队列取一批 → 整批 prefill（耗时按 pad 到最长 prompt 算）→ 整批 decode 到最长结束。
-# 注意 decode 时**已完成的请求不再占算力，但它的 slot 也不能被新请求复用**——这就是静态批处理的死穴。
+# 目标：实现最朴素的「request-level batching」，它也是后面所有对比的基线。
+#
+# 做法：GPU 空闲时从 waiting 取一批 → pad 到最长 prompt 后整批 prefill（`batch_info` 记录 padding 浪费）→
+# 一起 decode 到最长请求结束。已完成的请求不再占算力，但它们的 slot 也不会被新请求复用——
+# 这正是「等最长请求」的来源，也是连续批处理要消灭的东西。
 
 # %%
+
 def run_static(reqs, cost, max_num_seqs=16, pad=True):
     """静态批处理：整批 prefill → 一起 decode 到最长结束。"""
     pending = sorted(reqs, key=lambda r: r.arrival)
@@ -227,20 +382,21 @@ def run_static(reqs, cost, max_num_seqs=16, pad=True):
         running = [(r, lane) for r, lane in running if not r.finished]
     return summarize("静态批处理", reqs, segments, steps, now, max_num_seqs, batch_info)
 
-
 # %% [markdown]
-# ### 策略 B：连续批处理
+# ### Step 5 · 连续批处理：每个 iteration 重新组批
 #
-# 每个 iteration 做三件事：
+# 目标：让 batch 在每个 decode step 的边界都能换人。
 #
+# 做法：
 # 1. 把已到达的请求放进 `waiting`；
 # 2. **先给正在 decode 的请求各排 1 个 token**，剩余 token 预算再用来接纳新请求的 prefill；
 # 3. 一步执行完，完成的请求释放 slot，下一个 iteration 立刻有新请求补进来。
 #
-# 这里有一个重要限制：本章还没有 chunked prefill，所以一条 prompt 必须**整体塞进当前一步的 token 预算**，
-# 否则只能等。这正是第 06 章要拆掉的天花板。
-#
+# 这里有一个必须记住的限制：本章还没有 chunked prefill，一条 prompt 必须**整体塞进当前一步的 token 预算**，
+# 否则只能等。这条限制就是第 06 章要拆掉的天花板。
+
 # %%
+
 def run_continuous(reqs, cost, max_num_seqs=16, max_num_batched_tokens=4096):
     """连续批处理：每个 iteration 接纳新请求，decode 与 prefill 混批。"""
     pending = sorted(reqs, key=lambda r: r.arrival)
@@ -282,40 +438,18 @@ def run_continuous(reqs, cost, max_num_seqs=16, max_num_batched_tokens=4096):
     return summarize("连续批处理", reqs, segments, steps, now, max_num_seqs, [])
 
 # %% [markdown]
-# ### 固定到达序列
+# ### Step 6 · 验收：两条路径的不变量
 #
-# 两种策略必须吃**同一条**到达序列，否则不可比。这里用固定 seed 的 Poisson 到达，prompt 长度 128–2048，
-# 输出长度是重尾分布（中位数 32，长尾到 1024）——真实对话负载的样子。
+# 目标：用可执行的断言证明实现正确，而不是靠肉眼看图。
+#
+# 四条验收：
+# 1. 同构请求的静态 makespan 等于手算值 `prefill + (max_new−1) × decode`；
+# 2. 同到达、同长度时，连续批处理与静态批处理结果完全相等；
+# 3. 错峰到达时，连续批处理的中途短请求 TTFT 至少好 2x（新请求不必等整批）；
+# 4. 每个请求的 token 时间数量恰好等于 `max_new_tokens`。
 
 # %%
-def chat_workload(n=64, rate=16.0, seed=0):
-    rng = np.random.default_rng(seed)
-    t, reqs = 0.0, []
-    for i in range(n):
-        t += rng.exponential(1.0 / rate)
-        reqs.append(
-            Request(
-                id=i,
-                prompt_len=int(rng.choice([128, 256, 512, 1024, 2048], p=[0.25, 0.3, 0.25, 0.15, 0.05])),
-                max_new_tokens=int(rng.choice([8, 16, 32, 64, 128, 256, 512, 1024],
-                                              p=[0.20, 0.20, 0.20, 0.15, 0.10, 0.07, 0.05, 0.03])),
-                arrival=float(t),
-            )
-        )
-    return reqs
 
-
-workload = chat_workload()
-print("请求数 =", len(workload), "| 最后到达 =", round(workload[-1].arrival, 2), "s")
-pd.DataFrame([{"prompt_len": r.prompt_len, "max_new_tokens": r.max_new_tokens} for r in workload[:8]])
-
-# %% [markdown]
-# ### 断言即测试
-#
-# 用 4 条同构请求手算静态批处理的 makespan，和模拟器对账；再验证连续批处理不会比静态批处理慢，
-# 且每个请求恰好产出 `max_new_tokens` 个 token。
-
-# %%
 def fresh(reqs):
     """复制一批请求：保留到达序列，清空运行期状态（模拟器会就地修改 Request）。"""
     return [Request(r.id, r.prompt_len, r.max_new_tokens, r.arrival) for r in reqs]
@@ -336,12 +470,36 @@ assert b.metrics["TTFT p50(ms)"] * 2 < a.metrics["TTFT p50(ms)"]
 print(f"中途到达的短请求: 静态 TTFT p50 {a.metrics['TTFT p50(ms)']:.0f}ms vs 连续 {b.metrics['TTFT p50(ms)']:.0f}ms")
 
 # %% [markdown]
-# ### 标定：先验证「decode 对 batch 亚线性」这条假设
+# 四条验收全过：静态 makespan 与手算一致；同构场景下两种策略等价；把第二个请求的到达时间推迟到 0.05s 后，
+# 静态要等第一个请求整批跑完（TTFT p50 186ms），连续批处理在下一个 iteration 就接住了（15ms）。
 #
-# 成本模型最关键的一条是「decode 一步的耗时几乎不随 batch 增大」。用本机的 TinyGPT 实测一下：
-# 固定权重、固定上下文，batch 从 1 拉到 32，测每步耗时。
+# 到这里，调度器实现部分结束。接下来用三组实验回答「到底差多少、差在哪、参数怎么影响」。
+
+# %% [markdown]
+# ## 05.4 实测
+#
+# 三个实验，分别回答三个问题：
+#
+# | 实验 | 问题 | 产出 |
+# | --- | --- | --- |
+# | A | 成本模型的两条假设站得住吗？ | TinyGPT 实测 vs 模型（decode 对 batch 亚线性） |
+# | B | 连续批处理到底赢在哪？ | 吞吐/延迟/空闲率对比表 + 甘特图 + 三笔浪费拆解 |
+# | C | 负载与参数怎么改变工作点？ | 到达率扫描曲线 + `max_num_seqs` / `max_num_batched_tokens` 扫描表 |
+#
+# 测量协议：模拟器用固定 seed 生成到达序列；标定实验用本机 TinyGPT（M3 Ultra / MPS / torch 2.15，
+# `warmup=2, reps=5` 取中位数）。模拟器的成本常数按 A100 上的 7B 模型量级设置，
+# 绝对值不跨机器比较，只比较相对趋势。
+
+# %% [markdown]
+# ### 实验 A · 标定：decode 一步真的与 batch 无关吗
+#
+# 问题：整个模拟器建立在「decode 单步耗时对 batch 亚线性」这条假设上，必须先验证。
+#
+# 协议：固定权重与上下文（ctx=32），batch 从 1 拉到 32；每个配置测 20 个连续 decode step 的平均耗时，
+# 与成本模型的预测并排比较。
 
 # %%
+
 cfg = GPTConfig()
 tiny = TinyGPT(cfg).to(device).eval()
 
@@ -368,11 +526,13 @@ df_cal["实测/模型"] = df_cal["实测单步(ms)"] / df_cal["模型单步(ms)"
 df_cal.round(3)
 
 # %% [markdown]
-# **怎么读**：batch 从 1 到 32，TinyGPT 的每步耗时只涨了约 5%（中间点有 ±25% 的噪声），而线性增长会是 32 倍。
-# 绝对值当然对不上（TinyGPT 只有 2.8M 参数，本机 MPS 也不是 A100），但对不上的部分是**一个固定常数**，
-# 不影响「batch↑ → 单步耗时几乎不变 → 吞吐↑↑」这个结论。趋势可信，绝对值只用于算相对倍数。
+# **读表**：batch 从 1 到 32，TinyGPT 的每步耗时只涨了约 5%（中间点有 ±25% 的噪声），
+# 而线性增长会是 32 倍。模型预测的 6.1–9.8ms 与实测的 1.0–1.3ms 差一个固定常数——
+# TinyGPT 只有 2.8M 参数，本机 MPS 也不是 A100。**绝对值对不上不影响结论**：
+# 两者都远低于线性增长，亚线性假设成立，后面只比较相对倍数。
 
 # %%
+
 fig, ax = plt.subplots(figsize=(7.2, 4.2))
 norm = df_cal["实测单步(ms)"] / df_cal["实测单步(ms)"].iloc[0]
 model_norm = df_cal["模型单步(ms)"] / df_cal["模型单步(ms)"].iloc[0]
@@ -388,12 +548,42 @@ ax.legend()
 save(fig, "ch05_decode_scaling")
 
 # %% [markdown]
-# ## 05.3 实测
+# 图里三条线：红线是「如果每条请求串行」的线性增长，橙线是成本模型，蓝线是 TinyGPT 实测。
+# 蓝线与橙线都贴在下方，斜率远小于红线——这就是 batching 收益的物理来源。
+
+# %% [markdown]
+# ### 实验 B · 静态 vs 连续：吞吐、延迟与三笔浪费
 #
-# 跑同一条到达序列（64 个请求，λ=16 req/s，`max_num_seqs=16`），对比两种策略。
-# 每行都是同一份 `chat_workload`，模拟器里没有随机性，结果可复现。
+# 问题：同一到达序列、同一 `max_num_seqs=16`，连续批处理能赢多少？赢在哪个指标上？
+#
+# 协议：64 个请求，Poisson 到达 λ=16 req/s；prompt 长度 128–2048，输出重尾（中位数 32，长尾到 1024）。
+# 两边吃**同一条**到达序列（各自重新生成，模拟器会就地修改请求对象，不能共用实例）。
 
 # %%
+
+def chat_workload(n=64, rate=16.0, seed=0):
+    rng = np.random.default_rng(seed)
+    t, reqs = 0.0, []
+    for i in range(n):
+        t += rng.exponential(1.0 / rate)
+        reqs.append(
+            Request(
+                id=i,
+                prompt_len=int(rng.choice([128, 256, 512, 1024, 2048], p=[0.25, 0.3, 0.25, 0.15, 0.05])),
+                max_new_tokens=int(rng.choice([8, 16, 32, 64, 128, 256, 512, 1024],
+                                              p=[0.20, 0.20, 0.20, 0.15, 0.10, 0.07, 0.05, 0.03])),
+                arrival=float(t),
+            )
+        )
+    return reqs
+
+
+workload = chat_workload()
+print("请求数 =", len(workload), "| 最后到达 =", round(workload[-1].arrival, 2), "s")
+pd.DataFrame([{"prompt_len": r.prompt_len, "max_new_tokens": r.max_new_tokens} for r in workload[:8]])
+
+# %%
+
 static = run_static(chat_workload(), cost, max_num_seqs=16)
 continuous = run_continuous(chat_workload(), cost, max_num_seqs=16)  # 各自新建一份，互不污染
 table = pd.DataFrame([static.metrics, continuous.metrics])
@@ -402,18 +592,19 @@ print(f"连续/静态 吞吐倍数 = {ratio:.2f}x")
 table.round(2)
 
 # %% [markdown]
-# 读表，先看四个数字：
+# **读表**，先看四个数字：
 #
-# - **吞吐 2.55x**：同一块「GPU」、同一条到达序列，只是换调度策略。
-# - **TTFT p95 从 21.3s 降到 1.2s（约 18x）**：静态批处理里，请求到达后要等当前整批跑完才有机会进来。
+# - **吞吐 2.55x**：同一块「GPU」、同一条到达序列，只换调度策略。
+# - **TTFT p95 从 21.3s 降到 1.2s（约 18x）**：静态批处理里请求到达后要等当前整批跑完才有机会进来。
 # - **E2E p95 从 22.6s 降到 6.2s（约 3.6x）**：尾部请求不用排长队。
-# - **batch 利用率 0.37 vs 0.61**：GPU 并不是「闲着」（空闲率两行都是 0），而是**忙而无效**——静态批处理里
-#   大量 slot 在等最长请求，算力被 padding 和空转吃掉。
+# - **batch 利用率 0.37 vs 0.61**：GPU 并不是「闲着」（空闲率两行都是 0），而是**忙而无效**——
+#   静态批处理里大量 slot 在等最长请求，算力被 padding 和空转吃掉。
 #
 # 再看两个浪费指标：静态批处理 **57% 的 prefill 算力花在 padding 上**，**82% 的 decode slot-time 是空转**。
-# 但注意：padding 可以靠 03 章的分页注意力消掉，而「等最长请求」消不掉——后面参数实验会验证这一点。
+# 但注意：padding 可以靠 03 章的分页注意力消掉，而「等最长请求」消不掉——后面的参数实验会继续验证这一点。
 
 # %%
+
 def merge_segments(segments):
     """把同一 slot、同类型、首尾相接的段合并，甘特图才画得快。"""
     out = []
@@ -457,12 +648,26 @@ save(fig, "ch05_gantt")
 # 这就是「等最长请求」的可视化：GPU 一直在跑，但大部分 slot 在陪跑。
 
 # %% [markdown]
-# ### 扫描到达率：吞吐-延迟曲线
+# 把三笔浪费拆开看：
 #
-# 把 λ 从 2 拉到 64，每一步都重新生成到达序列（只改 rate，其余参数固定）。
+# 1. **padding**：静态批处理 57% 的 prefill 算力花在 pad 到最长 prompt 上；这一笔可以用 03 章的分页注意力消掉。
+# 2. **等最长请求**：82% 的 decode slot-time 是空转；只有「每个 iteration 重新组批」才能消掉这一笔。
+# 3. **批间空窗**：整批不结束，新请求进不来，队列越压越长——TTFT p95 = 21.3s 就是这么堆出来的。
+#
+# 连续批处理同时消灭第 2、3 笔，对第 1 笔无能为力（它仍然逐条 prefill）。
+# 这也解释了为什么工业实现里「连续批处理」和「分页注意力」要一起用：它们修的是不同的浪费。
+
+# %% [markdown]
+# ### 实验 C · 工作点：到达率与两个调度参数
+#
+# 问题：连续批处理的优势在不同负载下是否稳定？`max_num_seqs` 与 `max_num_batched_tokens`
+# 分别怎么改变工作点？
+#
+# 协议：到达率 λ ∈ {2, 4, 8, 16, 32, 64}，每个 λ 重新生成 64 个请求；固定 `max_num_seqs=16`。
 # 横轴取实际达到的吞吐，纵轴取 E2E p95——越靠右下越好。
 
 # %%
+
 rows = []
 for rate in [2, 4, 8, 16, 32, 64]:
     for fn in (run_static, run_continuous):
@@ -474,6 +679,7 @@ df_rate = pd.DataFrame(rows)
 df_rate.round(2)
 
 # %%
+
 fig, ax = plt.subplots(figsize=(7.2, 4.2))
 plot_df = df_rate.rename(columns={"吞吐(req/s)": "throughput", "E2E p95(s)": "p95", "到达率(req/s)": "arrival"})
 styles = {"静态批处理": ("o", "#EF4444", "Static batching"), "连续批处理": ("s", "#10B981", "Continuous batching")}
@@ -490,15 +696,13 @@ ax.legend()
 save(fig, "ch05_throughput_latency")
 
 # %% [markdown]
-# 读图：**静态批处理在 ~2.2 req/s 就撞墙**，λ 再大也只增加排队时间（点往上走、不往右走）。
+# **读图**：静态批处理在 ~2.2 req/s 就撞墙，λ 再大也只增加排队时间（点往上走、不往右走）；
 # 连续批处理一路涨到 ~6 req/s，p95 仍只有静态的 1/3。
-# 两条曲线的「拐点」就是 GPU 真正饱和的位置；拐点左侧是延迟受限，右侧是吞吐受限。
-# 生产上调参的目标就是：让工作点尽量靠近拐点、但别越过 SLO 线。
+# 两条曲线的「拐点」就是 GPU 真正饱和的位置：拐点左侧是延迟受限，右侧是吞吐受限。
+# 生产上调参的目标，就是让工作点尽量靠近拐点、但不越过 SLO 线。
 
 # %% [markdown]
-# ### 扫描 `max_num_seqs` 与 `max_num_batched_tokens`
-#
-# 这两个参数是 vLLM 调度器的两个「闸门」：
+# 接着把两个调度参数分别扫一遍。它们是人话里的「两个闸门」：
 #
 # - `max_num_seqs` 限制**一个 iteration 里最多有几条序列**（并发上限）；
 # - `max_num_batched_tokens` 限制**一个 iteration 里最多算多少个 token**（prefill + decode 都算）。
@@ -506,6 +710,7 @@ save(fig, "ch05_throughput_latency")
 # 前者小 → batch 不满、吞吐低；后者小 → 长 prompt 塞不进一步，调度器只能干等（没有 chunked prefill 时）。
 
 # %%
+
 rows = []
 for seqs in [1, 2, 4, 8, 16, 32]:
     m = run_continuous(chat_workload(), cost, max_num_seqs=seqs).metrics
@@ -515,6 +720,7 @@ df_seqs = pd.DataFrame(rows)
 df_seqs.round(2)
 
 # %%
+
 rows = []
 for budget in [2048, 4096, 8192, 16384]:
     m = run_continuous(chat_workload(), cost, max_num_seqs=16, max_num_batched_tokens=budget).metrics
@@ -528,25 +734,21 @@ df_budget.round(2)
 # 两张表各有一条「断崖」：
 #
 # - `max_num_seqs` 从 1 加到 16，吞吐从 154 涨到 792 tokens/s（5.1x），TTFT p95 从 51s 降到 1.2s。
-#   继续加到 32 吞吐不再涨（prefill 成为瓶颈），利用率却掉到 0.34——加并发只是在摊薄 batch 的有效负载。
+#   继续加到 32，吞吐不再涨（prefill 成为瓶颈），利用率却掉到 0.34——加并发只是在摊薄 batch 的有效负载。
 # - `max_num_batched_tokens=2048` 时吞吐掉到 319：负载里有 2048 token 的 prompt，而一步预算被 decode 占掉一部分，
-#   这些请求永远凑不齐「一整条 prompt 进同一步」，只能等 GPU 跑空。这就是第 06 章 chunked prefill 要解的限制：
-#   把一条 prompt 拆成多步算，预算再小也能前进。
+#   这些请求永远凑不齐「一整条 prompt 进同一步」，只能等 GPU 跑空。
 #
 # 记两个经验公式（后面章节会反复用）：
 #
 # - 吞吐 ≈ `min(max_num_seqs / 单请求每步成本 × 每步 token 数, 显存带宽 / 每 token 字节)`；
 # - 不开 chunked prefill 时，`max_num_batched_tokens ≥ 最长 prompt + 并发 decode 数`，否则会出现「永远排不进」。
 #
-# 再回答本章开头的问题：**静态批处理为什么吞吐低**？
-# 1. padding：一批 prompt 长度不同，短的要陪长的算——本实验里占掉 57% 的 prefill 算力；
-# 2. 等最长请求：输出重尾时，一批的时长由最长输出决定，短输出的 slot 全程空转——占掉 82% 的 decode slot-time；
-# 3. 批间空窗：整批不结束，新请求进不来，队列越压越长（TTFT p95 = 21s 就是这么来的）。
-# 前两条是「一个 batch 内部」的浪费，第三条是「batch 之间」的浪费。连续批处理同时消灭了第 2、3 条；
-# 第 1 条要靠分页注意力（03 章）——这也解释了为什么两个技术要一起用。
+# 最后把实验 B/C 连起来回答本章的问题：静态批处理吞吐低，是因为它同时付了 padding、等最长请求、批间空窗三笔钱；
+# 连续批处理修掉后两笔，padding 留给分页注意力；而 `max_num_batched_tokens` 的断崖说明，
+# **不做 chunked prefill 就永远要被「整条 prompt」绑架**——这就是下一章的入口。
 
 # %% [markdown]
-# ## 05.4 对照工业实现（vLLM）
+# ## 05.5 对照工业实现（vLLM）
 #
 # 本课程锁定 **vLLM 0.28.x**（V1 engine）。我们这 120 行模拟器，在 vLLM 里对应这些真实位置：
 #
@@ -562,24 +764,25 @@ df_budget.round(2)
 # | slot 与 KV 分配 | `KVCacheManager.allocate_slots()` | `vllm/v1/core/kv_cache_manager.py` |
 # | 我们的 `summarize` | `vllm bench serve` 的 TTFT/TPOT/吞吐统计 | `vllm/benchmarks/serve.py` |
 #
-# 差距在哪：
+# **差距在哪**：
 #
-# 1. **KV 是分页的**（03 章）：vLLM 的 `KVCacheManager` 按 block 分配，所以同样的 `max_num_seqs`
-#    能装下更多请求，也没有 padding；我们的模拟器只记「token 数」。
+# 1. **KV 是分页的**（03 章）：vLLM 的 `KVCacheManager` 按 block 分配，同样的 `max_num_seqs` 能装下更多请求，
+#    也没有 padding；我们的模拟器只记「token 数」。
 # 2. **V1 默认就是 chunked prefill**：`_schedule_running` 给 running 排 token 时，会把长 prompt 拆成
 #    `max_num_batched_tokens - num_decode_tokens` 的 chunk，与 decode 同批。第 06 章手写这个逻辑。
-# 3. **抢占**：显存不够时 vLLM 会把 running 队尾的请求 preempt（recompute 或 swap），
-#    我们的模拟器在第 06 章补上。
-# 4. **优先级 / FCFS / 多租户**：vLLM 有 `priority`、`--scheduling-policy`，本章只做 FCFS。
-#
+# 3. **抢占**：显存不够时 vLLM 会把 running 队尾的请求 preempt（recompute 或 swap），本章模拟器在第 06 章补上。
+# 4. **优先级 / 多租户**：vLLM 有 `priority`、`--scheduling-policy`，本章只做 FCFS。
+
+# %% [markdown]
 # 注：V1 在 0.8–0.10 期间重构过 scheduler 的方法拆分，类名与路径以课程锁定的 0.28.x 源码为准；
 # 用 `grep -n "def schedule" vllm/v1/core/sched/scheduler.py` 打开文件对一遍最稳。
 #
-# 你在 vLLM 里能直接看到的证据：`--max-num-seqs` 调小后 TTFT 下降、吞吐下降；
-# `--max-num-batched-tokens` 调到小于最长 prompt 时，日志会警告长请求排不进来。本章的两张表就是这两句话的手写版。
+# 在 vLLM 里能直接看到的证据：`--max-num-seqs` 调小后 TTFT 下降、吞吐下降；
+# `--max-num-batched-tokens` 调到小于最长 prompt 时，日志会警告长请求排不进来。
+# 本章的两张扫描表就是这两句话的手写版。
 
 # %% [markdown]
-# ## 05.5 练习与小结
+# ## 05.6 练习与小结
 #
 # **练习**
 #
@@ -600,11 +803,12 @@ df_budget.round(2)
 # - 连续批处理比静态批处理多做了什么？——在**每个 iteration 的边界**重新组批，而不是每个 batch 的边界。
 # - `max_num_seqs` 与 `max_num_batched_tokens` 分别限制什么？调小各自会先伤哪个指标？
 # - 静态批处理吞吐低的三笔浪费：padding、等最长请求、批间空窗——各自对应哪个指标？
+# - 为什么 `max_num_batched_tokens` 会有断崖？它和 chunked prefill 是什么关系？
 #
 # **小结与下一章**
 #
-# 本章的连续批处理把吞吐拉起来，但它的 ITL p95（29ms）比静态批处理（7.6ms）更差：
-# 因为一条 2048 token 的 prefill 一旦和 decode 同批，所有正在 decode 的请求都要多等约 170ms。
+# 本章的连续批处理把吞吐拉起来，但它的 ITL p95（29.3ms）比静态批处理（7.6ms）更差：
+# 一条 2048 token 的 prefill 一旦和 decode 同批，所有正在 decode 的请求都要多等约 170ms。
 # 第 06 章用两种手段修这个问题：**chunked prefill**（把 prefill 切小、与 decode 交替）与**抢占**（KV 不够时让请求让位）。
 #
 # **延伸阅读**
