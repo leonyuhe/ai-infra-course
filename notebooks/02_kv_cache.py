@@ -19,8 +19,8 @@
 # %% [markdown]
 # ## 02.1 问题与直觉
 #
-# 一句话：**生成第 t 个 token 时，前 t−1 个 token 的 K/V 只由它们自己决定**（因果注意力不
-# 看未来），所以每一步都重算历史 K/V 是纯浪费。
+# 一句话：**生成第 t 个 token 时，前 t−1 个 token 的 K/V 只由它们自己决定**（因果注意力不看未来），
+# 所以每一步都重算历史 K/V 是纯浪费。
 #
 # 先看时间轴：同一个 512-token prompt，连续生成 4 个 token，两种做法分别算了多少 token：
 #
@@ -28,45 +28,111 @@
 #
 # **反例（naive 生成）**：把「prompt + 已生成」整段喂进模型，每步都重算所有 token 的 K/V。
 # 生成 T 个 token 要做 T 次前向，第 t 次前向的长度是 S+t，总计算量 ≈ O(T·(S+T)) → 二次。
-# 真实模型里这部分是白烧的算力，batch 越大、上下文越长，浪费越吓人。
 #
-# **正解（KV cache）**：prefill 阶段一次性把 prompt 的 K/V 算好存起来（**compute-bound**，
-# 一次并行处理 S 个 token）；decode 阶段每步只算 1 个新 token，把它的 K/V 追加进缓存、
-# 用缓存的全部 K/V 做 attention（**memory-bound**，每步要把权重和整个 KV cache 读一遍）。
-#
-# | 阶段 | 一次处理多少 token | 瓶颈 | 本章实测（M3 Ultra · MPS · batch=8） |
-# | --- | --- | --- | --- |
-# | prefill | S（prompt 长度） | 算力 / kernel 并行 | 约 6.6–9.9 万 tok/s |
-# | decode | 1（每步） | 显存带宽 / kernel 启动 | 约 455–750 tok/s |
-#
-# 两个阶段的吞吐差两个数量级，这就是「TTFT 和 TPOT 要分开优化」的根源（00 章的口径）。
+# **正解（KV cache）**：第一次前向把 prompt 的 K/V 算好存起来（prefill），
+# 之后每步只喂 1 个新 token（decode），复用缓存里的 K/V，不再重算历史。
 
 # %% [markdown]
-# 显存布局很朴素：每一层存两份张量 K / V，形状 `(B, H, S, D)`；序列增长就是往 S 维追加：
+# ### prefill 和 decode 到底在做什么
+#
+# 把一次生成拆成两段，它们的输入形状完全不同：
+#
+# **prefill（预填充）**：输入 `(B, S)` 的整段 prompt，一次前向算出所有位置、所有层的 K/V，
+# 写进 KV cache；只取最后一个位置的 logits 去采样第一个回复 token。
+# 因为 S 个位置可以并行计算，GPU 的算力能被喂满——**算力受限**。
+#
+# **decode（解码）**：输入 `(B, 1)` 的新 token，用缓存里的 `[0, S)` K/V 做 attention，
+# 算出这个位置的 K/V 并追加到缓存，再取 logits 采样下一个 token。
+# 每一步只算 1 个 token，但要把**全部权重 + 整个 KV cache** 读一遍——**带宽受限**。
+#
+# 换句话说：**prefill 是"一次算很多"，decode 是"一次算一个、但每次都要搬一遍家底"。**
+
+# %% [markdown]
+# 两阶段的差异可以量出来。下表是本章 02.3 的实测（TinyGPT 2.8M，batch=8，M3 Ultra MPS，
+# warmup=2、reps=5 取中位数，上下文 256–2048）：
+#
+# | 阶段 | 一次前向的输入 | 瓶颈 | 本章实测（每序列） |
+# | --- | --- | --- | --- |
+# | prefill | `(B, S)`，S 个 prompt token 并行 | 算力 / kernel 并行度 | 约 6.6–9.9 万 tok/s |
+# | decode | `(B, 1)`，每步 1 个新 token | 带宽 / kernel 启动开销 | 约 455–750 tok/s |
+#
+# 读数口径很重要，否则会误比：
+#
+# - prefill 吞吐 = `S ÷ prefill 耗时`（每个序列每秒能 prefill 多少 token）；
+# - decode 吞吐 = `1 ÷ 单步耗时`（每个序列每秒能生成多少 token）；
+# - batch=8 表示一次前向同时服务 8 条序列；表里是**每序列**数字，聚合吞吐要 ×8。
+#
+# 差两个数量级的原因不是 decode 算得多，而是它**读得多、算得少**：每生成 1 个 token，
+# 都要把全部权重和整个 KV cache 读一遍，算术强度 ≈ 1 FLOP/byte，完全受带宽约束。
+# 这也是 batch 越大 decode 越划算的原因（同一份权重服务更多请求），第 05 章的连续批处理就围绕这一点。
+
+# %% [markdown]
+# ### KV cache 占多少显存
+#
+# 显存布局很朴素：每一层存两份张量 K / V，形状 `(B, H_kv, S, D)`；序列增长就是往 S 维追加：
 #
 # ![](../assets/figures/ch02_memory_layout.svg)
 #
-# 把这张图换算成公式（全是乘法，请记住它）：
+# 把图换算成公式（全是乘法）：
 #
 # ```text
 # KV 字节 = 2 × L × H × D × S × B × dtype_bytes
 # ```
 #
-# 其中 L 是层数、H 是 **KV 头数**（GQA 下小于注意力头数）、D 是 head_dim、S 是序列长度、
-# B 是 batch。2 代表 K 和 V 两份张量。这个公式本章会用两种方式验证：正向算 → 对比
-# `tensor.nbytes`，反向从 `tensor.nbytes` 解出 S → 必须等于配置值。
+# - `2`：K 和 V 两份张量；
+# - `L`：层数；
+# - `H`：**KV 头数**（GQA 下小于注意力头数，这是最容易算错的地方）；
+# - `D`：每个头的维度 `head_dim`；
+# - `S`：序列长度；`B`：batch；`dtype_bytes`：每个元素几字节（fp16=2，fp32=4）。
 #
-# 本章定义的接口契约，03/04 章会原样复用：
+# 用本章的 TinyGPT 代进去（L=2, H=4, D=64, S=4096, B=1, fp32）：
+#
+# ```text
+# 2 × 2 × 4 × 64 × 4096 × 1 × 4 = 16,777,216 字节 = 16 MiB
+# ```
+
+# %% [markdown]
+# 这个公式会用两种方式验证，02.3 的表格会同时给出三列：
+#
+# 1. **正向验证**：按公式算出的字节数，必须等于缓存里所有 K/V 张量的 `t.nbytes` 之和。
+#    `t.nbytes` 是 PyTorch 张量**实际占用**的字节数（`numel × element_size`），
+#    对上了就说明公式没有漏项；
+# 2. **反向验证**：只给总字节数、层数、头数、维度、batch、dtype，反解
+#    `S = 字节数 ÷ (2·L·H·D·B·dtype_bytes)`，结果必须等于构造缓存时传入的 `seq_len`。
+#
+# 一个公式正反都能对上，才说明真的理解了它的每一项，而不是背下来的。
+
+# %% [markdown]
+# ### 为什么先定义接口
+#
+# 本章要写一个**连续预分配**的 KV cache；第 03 章会换成**分页**实现，第 04 章再加**前缀共享**。
+# 三种实现的内部结构完全不同，但上层 attention 的调用方式应该不变——否则每章都要重写 attention。
+#
+# 所以先约定 4 个方法（03/04 章原样复用）：
 #
 # | 方法 | 语义 |
 # | --- | --- |
 # | `append(layer, k, v)` | 把本步新算的 K/V 写到当前长度之后 |
 # | `get(layer, upto=None)` | 取回 `[0, upto)` 的 K/V（`upto` 默认到当前长度） |
-# | `advance(n)` | 推进逻辑长度（一层的 append 写相同位置，全部层写完后才推进一次） |
+# | `advance(n)` | 推进逻辑长度 |
 # | `seq_len` | 当前已缓存的 token 数 |
 #
-# 为什么 `append` 和 `advance` 要分开？因为模型有 L 层，每一层都往自己的缓存写同一段位置，
-# 但长度只能等所有层都写完后推进一次。这个细节在 03/04 章写分页缓存时会反复出现。
+# 为什么 `append` 和 `advance` 要分开？看一次 decode step 的执行顺序：
+#
+# ```text
+# 当前 seq_len = n
+# layer 0: append(k0, v0)   -> 写到位置 n
+# layer 1: append(k1, v1)   -> 写到位置 n
+# ...
+# layer L-1: append(...)    -> 写到位置 n
+# advance(1)                -> seq_len: n -> n+1
+# ```
+#
+# 所有层必须写到**同一个位置 n**，所以长度不能在某一层写完后立刻推进；
+# 要等 L 层都写完，再统一 `advance`。prefill 时同理：每层一次 `append` 写入 T 个 token，
+# 全部层写完后 `advance(T)`。
+#
+# `seq_len` 同时被两处使用：RoPE 的 `start_pos`（新 token 的位置）和 causal mask 的边界。
 
 # %% [markdown]
 # ## 02.2 从零实现

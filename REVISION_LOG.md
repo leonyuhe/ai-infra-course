@@ -26,6 +26,7 @@
 | 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 01.4 重写：先解释“单请求→多请求”的变化，再逐条讲 4 个 vLLM 映射，并挂到后续章节 | 本地 |
 | 2026-11-05 | `notebooks/02_kv_cache.py` | 修正一处对话口吻（“给我……你能不能”） | 本地 |
 | 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 实测 4 二修：统一工厂/公路/货物类比；明确 roofline 横轴是 AI 不是带宽；新增“固定负载只加带宽”第二张图（decode 线性上升、prefill 水平线） | 本地 |
+| 2026-11-05 | `notebooks/02_kv_cache.py` | 02.1 重写：补 prefill/decode 两阶段的输入形状与瓶颈、实测口径（batch=8、每序列 tok/s）、KV 显存公式推导与 16 MiB 算例、正反向验证含义、接口契约（append/advance 时间线）与为什么需要接口 | 本地 |
 |  |  |  |  |
 
 ## 一次性发布 checklist（全部修订完成后）
