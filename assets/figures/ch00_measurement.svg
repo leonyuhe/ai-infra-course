@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 460" width="960" height="460" role="img" aria-labelledby="t d">
+  <title id="t">Five steps of a trustworthy measurement</title>
+  <desc id="d">Pipeline: warmup, sync, repeat, percentiles, environment snapshot, plus four common sources of measurement error.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="460" fill="#FFFFFF"/>
+
+  <text x="40" y="46" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="700" fill="#111827">A trustworthy measurement needs 5 steps</text>
+  <text x="40" y="70" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#6B7280">Every AI Infra tuning conclusion rests on this pipeline</text>
+
+  <!-- 5 steps -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="30" y="100" width="160" height="96" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="110" y="128" text-anchor="middle" font-size="15" font-weight="700" fill="#1E3A8A">1 · Warmup</text>
+    <text x="110" y="152" text-anchor="middle" font-size="12" fill="#374151">kernels compile, caches</text>
+    <text x="110" y="170" text-anchor="middle" font-size="12" fill="#374151">and clocks settle</text>
+    <text x="110" y="188" text-anchor="middle" font-size="11" fill="#6B7280">warmup ≥ 3</text>
+
+    <rect x="215" y="100" width="160" height="96" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="295" y="128" text-anchor="middle" font-size="15" font-weight="700" fill="#1E3A8A">2 · Sync</text>
+    <text x="295" y="152" text-anchor="middle" font-size="12" fill="#374151">MPS / CUDA is async:</text>
+    <text x="295" y="170" text-anchor="middle" font-size="12" fill="#374151">no sync = launch time only</text>
+    <text x="295" y="188" text-anchor="middle" font-size="11" fill="#6B7280">sync() before and after</text>
+
+    <rect x="400" y="100" width="160" height="96" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="480" y="128" text-anchor="middle" font-size="15" font-weight="700" fill="#1E3A8A">3 · Repeat</text>
+    <text x="480" y="152" text-anchor="middle" font-size="12" fill="#374151">one sample is noise,</text>
+    <text x="480" y="170" text-anchor="middle" font-size="12" fill="#374151">use ≥ 5, ideally 50</text>
+    <text x="480" y="188" text-anchor="middle" font-size="11" fill="#6B7280">reps ≥ 5</text>
+
+    <rect x="585" y="100" width="160" height="96" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="665" y="128" text-anchor="middle" font-size="15" font-weight="700" fill="#1E3A8A">4 · Percentiles</text>
+    <text x="665" y="152" text-anchor="middle" font-size="12" fill="#374151">means hide the tail,</text>
+    <text x="665" y="170" text-anchor="middle" font-size="12" fill="#374151">report p50 / p90 / p99</text>
+    <text x="665" y="188" text-anchor="middle" font-size="11" fill="#6B7280">SLO watches the tail</text>
+
+    <rect x="770" y="100" width="160" height="96" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="850" y="128" text-anchor="middle" font-size="15" font-weight="700" fill="#1E3A8A">5 · Snapshot</text>
+    <text x="850" y="152" text-anchor="middle" font-size="12" fill="#374151">chip, RAM, versions —</text>
+    <text x="850" y="170" text-anchor="middle" font-size="12" fill="#374151">or numbers are incomparable</text>
+    <text x="850" y="188" text-anchor="middle" font-size="11" fill="#6B7280">env_report()</text>
+  </g>
+
+  <!-- arrows -->
+  <g stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)">
+    <line x1="192" y1="148" x2="211" y2="148"/>
+    <line x1="377" y1="148" x2="396" y2="148"/>
+    <line x1="562" y1="148" x2="581" y2="148"/>
+    <line x1="747" y1="148" x2="766" y2="148"/>
+  </g>
+
+  <!-- contamination -->
+  <text x="30" y="252" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#111827">Four common sources of error</text>
+
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="30" y="270" width="215" height="92" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="46" y="298" font-size="14" font-weight="700" fill="#991B1B">Async execution</text>
+    <text x="46" y="322" font-size="12" fill="#7F1D1D">timer stops before the device finishes</text>
+    <text x="46" y="342" font-size="11" fill="#B91C1C">-&gt; too low, worse for large ops</text>
+
+    <rect x="265" y="270" width="215" height="92" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="281" y="298" font-size="14" font-weight="700" fill="#991B1B">First-run cost</text>
+    <text x="281" y="322" font-size="12" fill="#7F1D1D">kernel compile / allocation</text>
+    <text x="281" y="342" font-size="11" fill="#B91C1C">-&gt; first call inflated; warm up first</text>
+
+    <rect x="500" y="270" width="215" height="92" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="516" y="298" font-size="14" font-weight="700" fill="#991B1B">Clock &amp; scheduling</text>
+    <text x="516" y="322" font-size="12" fill="#7F1D1D">thermal throttling, background apps</text>
+    <text x="516" y="342" font-size="11" fill="#B91C1C">-&gt; p90 drifts away from p50</text>
+
+    <rect x="735" y="270" width="195" height="92" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="751" y="298" font-size="14" font-weight="700" fill="#991B1B">Single sample</text>
+    <text x="751" y="322" font-size="12" fill="#7F1D1D">concluding from one run</text>
+    <text x="751" y="342" font-size="11" fill="#B91C1C">-&gt; cannot separate trend from noise</text>
+  </g>
+
+  <!-- conclusion -->
+  <rect x="30" y="390" width="900" height="46" rx="8" fill="#F3F4F6"/>
+  <text x="46" y="419" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#111827">
+    Every number needs its conditions. Same code, different machine or version means a different number — trends matter more than absolutes.
+  </text>
+</svg>

@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520" role="img" aria-labelledby="t d">
+  <title id="t">Contiguous KV reservation vs paged KV blocks</title>
+  <desc id="d">Left: each request reserves max_seq_len contiguous tokens, wasting most of it as internal fragmentation. Right: fixed-size KV blocks are allocated on demand and a per-request block table maps logical positions to physical block ids.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#F59E0B"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="520" fill="#FFFFFF"/>
+
+  <text x="36" y="44" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="22" font-weight="700" fill="#111827">Contiguous KV reservation vs paged KV blocks</text>
+  <text x="36" y="70" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" fill="#6B7280">Same KV pool, two allocation policies; the measured fragmentation difference is 74% vs 1.3% (200 requests)</text>
+
+  <!-- left panel -->
+  <rect x="36" y="92" width="420" height="316" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="52" y="120" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#991B1B">Contiguous: reserve max_seq_len per request</text>
+  <g font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif">
+    <text x="52" y="152" font-size="12" fill="#374151">req A (len 400)</text>
+    <rect x="52" y="158" width="80" height="24" rx="4" fill="#DBEAFE" stroke="#2563EB" stroke-width="2"/>
+    <rect x="132" y="158" width="308" height="24" rx="4" fill="#FEE2E2" stroke="#EF4444" stroke-width="1.4"/>
+    <text x="286" y="175" text-anchor="middle" font-size="11" fill="#991B1B">reserved but never used</text>
+
+    <text x="52" y="208" font-size="12" fill="#374151">req B (len 800)</text>
+    <rect x="52" y="214" width="160" height="24" rx="4" fill="#DBEAFE" stroke="#2563EB" stroke-width="2"/>
+    <rect x="212" y="214" width="228" height="24" rx="4" fill="#FEE2E2" stroke="#EF4444" stroke-width="1.4"/>
+    <text x="326" y="231" text-anchor="middle" font-size="11" fill="#991B1B">wasted</text>
+
+    <text x="52" y="264" font-size="12" fill="#374151">req C (len 1500)</text>
+    <rect x="52" y="270" width="300" height="24" rx="4" fill="#DBEAFE" stroke="#2563EB" stroke-width="2"/>
+    <rect x="352" y="270" width="88" height="24" rx="4" fill="#FEE2E2" stroke="#EF4444" stroke-width="1.4"/>
+  </g>
+  <text x="52" y="322" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#991B1B">utilization = 26.1%</text>
+  <text x="52" y="344" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#991B1B">fragmentation = 73.9%</text>
+  <text x="52" y="366" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#991B1B">Qwen3-8B: 56.2 GiB for 200 requests</text>
+  <text x="52" y="390" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#7F1D1D">also: a new request may not find a contiguous hole at all</text>
+
+  <!-- right panel -->
+  <rect x="476" y="92" width="448" height="316" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2"/>
+  <text x="492" y="120" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#065F46">Paged: blocks on demand + block table</text>
+
+  <!-- block table -->
+  <text x="492" y="150" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#374151">request block table (logical to physical)</text>
+  <g font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif">
+    <rect x="492" y="160" width="44" height="30" rx="6" fill="#F3F4F6" stroke="#6B7280" stroke-width="2"/>
+    <text x="514" y="180" text-anchor="middle" font-size="12" fill="#111827">log 0</text>
+    <rect x="542" y="160" width="44" height="30" rx="6" fill="#F3F4F6" stroke="#6B7280" stroke-width="2"/>
+    <text x="564" y="180" text-anchor="middle" font-size="12" fill="#111827">log 1</text>
+    <rect x="592" y="160" width="44" height="30" rx="6" fill="#F3F4F6" stroke="#6B7280" stroke-width="2"/>
+    <text x="614" y="180" text-anchor="middle" font-size="12" fill="#111827">log 2</text>
+    <rect x="642" y="160" width="44" height="30" rx="6" fill="#F3F4F6" stroke="#6B7280" stroke-width="2"/>
+    <text x="664" y="180" text-anchor="middle" font-size="12" fill="#111827">log 3</text>
+    <line x1="514" y1="196" x2="514" y2="224" stroke="#F59E0B" stroke-width="2" marker-end="url(#arrow-accent)"/>
+    <line x1="564" y1="196" x2="564" y2="224" stroke="#F59E0B" stroke-width="2" marker-end="url(#arrow-accent)"/>
+    <line x1="614" y1="196" x2="614" y2="224" stroke="#F59E0B" stroke-width="2" marker-end="url(#arrow-accent)"/>
+    <line x1="664" y1="196" x2="664" y2="224" stroke="#F59E0B" stroke-width="2" marker-end="url(#arrow-accent)"/>
+  </g>
+
+  <!-- physical pool -->
+  <text x="492" y="248" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#374151">physical KV pool (each cell = one block = block_size tokens)</text>
+  <g font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif">
+    <rect x="492" y="256" width="40" height="40" rx="6" fill="#F3F4F6" stroke="#9CA3AF" stroke-width="2"/>
+    <text x="512" y="281" text-anchor="middle" font-size="12" fill="#6B7280">0</text>
+    <rect x="538" y="256" width="40" height="40" rx="6" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <text x="558" y="281" text-anchor="middle" font-size="12" fill="#065F46">1</text>
+    <rect x="584" y="256" width="40" height="40" rx="6" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <text x="604" y="281" text-anchor="middle" font-size="12" fill="#065F46">2</text>
+    <rect x="630" y="256" width="40" height="40" rx="6" fill="#F3F4F6" stroke="#9CA3AF" stroke-width="2"/>
+    <text x="650" y="281" text-anchor="middle" font-size="12" fill="#6B7280">3</text>
+    <rect x="676" y="256" width="40" height="40" rx="6" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <text x="696" y="281" text-anchor="middle" font-size="12" fill="#065F46">4</text>
+    <rect x="722" y="256" width="40" height="40" rx="6" fill="#F3F4F6" stroke="#9CA3AF" stroke-width="2"/>
+    <text x="742" y="281" text-anchor="middle" font-size="12" fill="#6B7280">5</text>
+    <rect x="768" y="256" width="40" height="40" rx="6" fill="#F3F4F6" stroke="#9CA3AF" stroke-width="2"/>
+    <text x="788" y="281" text-anchor="middle" font-size="12" fill="#6B7280">6</text>
+    <rect x="814" y="256" width="40" height="40" rx="6" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <text x="834" y="281" text-anchor="middle" font-size="12" fill="#065F46">7</text>
+    <text x="866" y="281" font-size="13" fill="#6B7280">...</text>
+    <text x="492" y="318" font-size="11" fill="#6B7280">allocated: blocks 4, 1, 7, 2 in this order (green; non-contiguous is fine)</text>
+  </g>
+  <text x="492" y="344" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#065F46">utilization = 98.7%</text>
+  <text x="492" y="366" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#065F46">waste = only the tail of the last block</text>
+  <text x="492" y="388" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#065F46">Qwen3-8B: 14.8 GiB for the same 200 requests</text>
+
+  <!-- bottom -->
+  <rect x="36" y="428" width="888" height="42" rx="8" fill="#F3F4F6"/>
+  <text x="52" y="455" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#111827">Block table cost: one int per block, e.g. 26.4 KiB for 6758 blocks (block_size=16) against 14.8 GiB of KV, roughly 1.7e-6 of the payload.</text>
+
+  <rect x="36" y="478" width="888" height="30" rx="8" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2"/>
+  <text x="52" y="499" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#92400E">Trade-off: smaller blocks mean less waste but more table entries and more gather work per attention step.</text>
+</svg>

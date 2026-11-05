@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560" role="img" aria-labelledby="t d">
+  <title id="t">vLLM bottleneck decision tree</title>
+  <desc id="d">Decision tree starting from stalled throughput or exploding p99 latency, with five branches: compute bound, bandwidth bound, KV shortage, scheduling queue, network/client. Each branch gives one diagnostic command and three actions.</desc>
+  <defs>
+    <marker id="dt-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="560" fill="#FFFFFF"/>
+  <text x="30" y="34" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="700" fill="#111827">Bottleneck decision tree: after a bench run, ask who hits the ceiling first</text>
+  <text x="30" y="56" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#6B7280">Five branches ordered from cheapest to most expensive to check; each gives one copy-paste diagnostic command</text>
+
+  <!-- root -->
+  <rect x="250" y="76" width="460" height="52" rx="8" fill="#1E3A8A" stroke="#2563EB" stroke-width="2"/>
+  <text x="480" y="100" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#FFFFFF">Symptom: throughput stalls / p99 tail latency blows up</text>
+  <text x="480" y="119" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="10.5" fill="#BFDBFE">Read the sweep first: where does throughput flatten? where does p99 take off (11.3)</text>
+
+  <!-- branch connectors -->
+  <g stroke="#6B7280" stroke-width="2" fill="none">
+    <path d="M 480 128 L 480 144"/>
+    <path d="M 114 144 L 834 144"/>
+  </g>
+  <g stroke="#6B7280" stroke-width="2" marker-end="url(#dt-arrow)">
+    <line x1="114" y1="144" x2="114" y2="156"/>
+    <line x1="294" y1="144" x2="294" y2="156"/>
+    <line x1="474" y1="144" x2="474" y2="156"/>
+    <line x1="654" y1="144" x2="654" y2="156"/>
+    <line x1="834" y1="144" x2="834" y2="156"/>
+  </g>
+
+  <!-- branch 1: compute -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="30" y="160" width="168" height="66" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2"/>
+    <text x="114" y="184" text-anchor="middle" font-size="13" font-weight="700" fill="#991B1B">1) Compute bound</text>
+    <text x="114" y="201" text-anchor="middle" font-size="10.5" fill="#7F1D1D">SM util stays &gt; 90%</text>
+    <text x="114" y="217" text-anchor="middle" font-size="10.5" fill="#7F1D1D">bigger batch doesn't help</text>
+
+    <rect x="30" y="248" width="168" height="86" rx="8" fill="#FFF5F5" stroke="#EF4444" stroke-width="1.5"/>
+    <text x="40" y="267" font-size="10.5" font-weight="700" fill="#991B1B">Diagnose</text>
+    <text x="40" y="286" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#7F1D1D">nvidia-smi dmon -s u</text>
+    <text x="40" y="302" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#7F1D1D">nvidia-smi -q -d POWER</text>
+    <text x="40" y="318" font-size="9.5" fill="#B91C1C">SM pinned + power capped</text>
+
+    <rect x="30" y="352" width="168" height="108" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="1.5"/>
+    <text x="40" y="371" font-size="10.5" font-weight="700" fill="#991B1B">Actions</text>
+    <text x="40" y="390" font-size="10.5" fill="#7F1D1D">1) smaller / quantized</text>
+    <text x="40" y="408" font-size="10.5" fill="#7F1D1D">2) add tensor-parallel</text>
+    <text x="40" y="426" font-size="10.5" fill="#7F1D1D">3) relax the SLO first</text>
+    <text x="40" y="446" font-size="9.5" fill="#B91C1C">don't tune max_num_seqs</text>
+  </g>
+
+  <!-- branch 2: memory bandwidth -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="210" y="160" width="168" height="66" rx="8" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2"/>
+    <text x="294" y="184" text-anchor="middle" font-size="13" font-weight="700" fill="#92400E">2) Bandwidth bound</text>
+    <text x="294" y="201" text-anchor="middle" font-size="10.5" fill="#78350F">DRAM util &gt; 85%</text>
+    <text x="294" y="217" text-anchor="middle" font-size="10.5" fill="#78350F">SM low (classic decode)</text>
+
+    <rect x="210" y="248" width="168" height="86" rx="8" fill="#FFFCF2" stroke="#F59E0B" stroke-width="1.5"/>
+    <text x="220" y="267" font-size="10.5" font-weight="700" fill="#92400E">Diagnose</text>
+    <text x="220" y="286" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#78350F">nvidia-smi --query-gpu=</text>
+    <text x="220" y="302" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#78350F"> utilization.memory -l 1</text>
+    <text x="220" y="318" font-size="9.5" fill="#92400E">DRAM high, SM low</text>
+
+    <rect x="210" y="352" width="168" height="108" rx="8" fill="#FFFBEB" stroke="#F59E0B" stroke-width="1.5"/>
+    <text x="220" y="371" font-size="10.5" font-weight="700" fill="#92400E">Actions</text>
+    <text x="220" y="390" font-size="10.5" fill="#78350F">1) fp8 / int8 weights</text>
+    <text x="220" y="408" font-size="10.5" fill="#78350F">2) bigger batch</text>
+    <text x="220" y="426" font-size="10.5" fill="#78350F">3) check KV bandwidth</text>
+    <text x="220" y="446" font-size="9.5" fill="#92400E">spec decode helps too</text>
+  </g>
+
+  <!-- branch 3: KV shortage -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="390" y="160" width="168" height="66" rx="8" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2"/>
+    <text x="474" y="184" text-anchor="middle" font-size="13" font-weight="700" fill="#4C1D95">3) KV shortage</text>
+    <text x="474" y="201" text-anchor="middle" font-size="10.5" fill="#5B21B6">kv_cache_usage &gt; 0.9</text>
+    <text x="474" y="217" text-anchor="middle" font-size="10.5" fill="#5B21B6">Preemption in logs</text>
+
+    <rect x="390" y="248" width="168" height="86" rx="8" fill="#FBF9FF" stroke="#7C3AED" stroke-width="1.5"/>
+    <text x="400" y="267" font-size="10.5" font-weight="700" fill="#4C1D95">Diagnose</text>
+    <text x="400" y="286" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#5B21B6">curl -s :8000/metrics |</text>
+    <text x="400" y="302" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#5B21B6">  grep kv_cache_usage</text>
+    <text x="400" y="318" font-size="9.5" fill="#6D28D9">also check Preemption logs</text>
+
+    <rect x="390" y="352" width="168" height="108" rx="8" fill="#F5F3FF" stroke="#7C3AED" stroke-width="1.5"/>
+    <text x="400" y="371" font-size="10.5" font-weight="700" fill="#4C1D95">Actions</text>
+    <text x="400" y="390" font-size="10.5" fill="#5B21B6">1) raise GPU mem util</text>
+    <text x="400" y="408" font-size="10.5" fill="#5B21B6">2) shrink max-model-len</text>
+    <text x="400" y="426" font-size="10.5" fill="#5B21B6">3) enable prefix cache</text>
+    <text x="400" y="446" font-size="9.5" fill="#6D28D9">else add GPUs / replicas</text>
+  </g>
+
+  <!-- branch 4: scheduling queue -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="570" y="160" width="168" height="66" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="654" y="184" text-anchor="middle" font-size="13" font-weight="700" fill="#1E3A8A">4) Scheduling queue</text>
+    <text x="654" y="201" text-anchor="middle" font-size="10.5" fill="#1E40AF">waiting &gt; 0 and growing</text>
+    <text x="654" y="217" text-anchor="middle" font-size="10.5" fill="#1E40AF">running at max_num_seqs</text>
+
+    <rect x="570" y="248" width="168" height="86" rx="8" fill="#F8FAFF" stroke="#2563EB" stroke-width="1.5"/>
+    <text x="580" y="267" font-size="10.5" font-weight="700" fill="#1E3A8A">Diagnose</text>
+    <text x="580" y="286" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#1E40AF">curl -s :8000/metrics |</text>
+    <text x="580" y="302" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#1E40AF">  grep num_requests_</text>
+    <text x="580" y="318" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#1E40AF">  waiting</text>
+
+    <rect x="570" y="352" width="168" height="108" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="1.5"/>
+    <text x="580" y="371" font-size="10.5" font-weight="700" fill="#1E3A8A">Actions</text>
+    <text x="580" y="390" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#1E40AF">--max-num-seqs</text>
+    <text x="580" y="408" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#1E40AF">--max-num-batched-</text>
+    <text x="580" y="424" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#1E40AF">  tokens</text>
+    <text x="580" y="446" font-size="9.5" fill="#2563EB">queue = deterministic latency</text>
+  </g>
+
+  <!-- branch 5: network / client -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="750" y="160" width="168" height="66" rx="8" fill="#F3F4F6" stroke="#6B7280" stroke-width="2"/>
+    <text x="834" y="184" text-anchor="middle" font-size="13" font-weight="700" fill="#374151">5) Network / client</text>
+    <text x="834" y="201" text-anchor="middle" font-size="10.5" fill="#4B5563">server TPOT is fine</text>
+    <text x="834" y="217" text-anchor="middle" font-size="10.5" fill="#4B5563">client first-byte jitter</text>
+
+    <rect x="750" y="248" width="168" height="86" rx="8" fill="#F9FAFB" stroke="#6B7280" stroke-width="1.5"/>
+    <text x="760" y="267" font-size="10.5" font-weight="700" fill="#374151">Diagnose</text>
+    <text x="760" y="286" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#4B5563">curl -o /dev/null -w</text>
+    <text x="760" y="302" font-family="'SFMono-Regular', Menlo, monospace" font-size="9.5" fill="#4B5563">  '%{time_connect}' URL</text>
+    <text x="760" y="318" font-size="9.5" fill="#6B7280">big connect = network/proxy</text>
+
+    <rect x="750" y="352" width="168" height="108" rx="8" fill="#F3F4F6" stroke="#6B7280" stroke-width="1.5"/>
+    <text x="760" y="371" font-size="10.5" font-weight="700" fill="#374151">Actions</text>
+    <text x="760" y="390" font-size="10.5" fill="#4B5563">1) async + keep-alive</text>
+    <text x="760" y="408" font-size="10.5" fill="#4B5563">2) stream tokens</text>
+    <text x="760" y="426" font-size="10.5" fill="#4B5563">3) check TLS / proxy</text>
+    <text x="760" y="446" font-size="9.5" fill="#6B7280">bench CPU not maxed</text>
+  </g>
+
+  <rect x="30" y="486" width="900" height="44" rx="8" fill="#F3F4F6"/>
+  <text x="44" y="505" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#111827">
+    Order: client/network first (cheapest) -&gt; queueing (waiting) -&gt; model precision and parallelism last. Change one parameter at a time,
+  </text>
+  <text x="44" y="522" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="11" fill="#6B7280">
+    re-run the 11.3 sweep and record p50 / p99. Evidence first: without metrics or nvidia-smi numbers, tuning is just gambling.
+  </text>
+</svg>

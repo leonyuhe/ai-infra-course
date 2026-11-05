@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520" role="img" aria-labelledby="t d">
+  <title id="t">Prefix cache: chained block hashes and shared KV blocks</title>
+  <desc id="d">Two requests share a system prompt. Each full block is hashed together with its parent block hash. The prefix cache maps those hashes to physical KV blocks, so request B reuses the system prompt blocks instead of recomputing them.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#10B981"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#F59E0B"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="520" fill="#FFFFFF"/>
+
+  <text x="36" y="44" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="22" font-weight="700" fill="#111827">Prefix cache: chained block hashes and shared KV blocks</text>
+  <text x="36" y="70" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" fill="#6B7280">Block hash = hash(parent hash, block tokens): a block is reusable only if the whole prefix before it is identical</text>
+
+  <!-- request A -->
+  <text x="36" y="110" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#111827">Request A: system prompt (3 blocks) + question (1 block)</text>
+  <g font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif">
+    <rect x="36" y="124" width="150" height="52" rx="8" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <text x="111" y="146" text-anchor="middle" font-size="12" font-weight="700" fill="#065F46">block 0 (sys)</text>
+    <text x="111" y="164" text-anchor="middle" font-size="11" fill="#065F46">h0 = hash(0, tok[0:16])</text>
+
+    <rect x="196" y="124" width="150" height="52" rx="8" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <text x="271" y="146" text-anchor="middle" font-size="12" font-weight="700" fill="#065F46">block 1 (sys)</text>
+    <text x="271" y="164" text-anchor="middle" font-size="11" fill="#065F46">h1 = hash(h0, tok[16:32])</text>
+
+    <rect x="356" y="124" width="150" height="52" rx="8" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <text x="431" y="146" text-anchor="middle" font-size="12" font-weight="700" fill="#065F46">block 2 (sys)</text>
+    <text x="431" y="164" text-anchor="middle" font-size="11" fill="#065F46">h2 = hash(h1, tok[32:48])</text>
+
+    <rect x="516" y="124" width="150" height="52" rx="8" fill="#DBEAFE" stroke="#2563EB" stroke-width="2"/>
+    <text x="591" y="146" text-anchor="middle" font-size="12" font-weight="700" fill="#1E3A8A">block 3 (question)</text>
+    <text x="591" y="164" text-anchor="middle" font-size="11" fill="#1E3A8A">h3 = hash(h2, tok[48:64])</text>
+  </g>
+  <g stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)">
+    <line x1="188" y1="150" x2="194" y2="150"/>
+    <line x1="348" y1="150" x2="354" y2="150"/>
+    <line x1="508" y1="150" x2="514" y2="150"/>
+  </g>
+
+  <!-- cache table -->
+  <rect x="36" y="204" width="420" height="132" rx="8" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2"/>
+  <text x="52" y="230" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" font-weight="700" fill="#4C1D95">prefix cache: block hash to physical block id</text>
+  <g font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif">
+    <text x="56" y="258" font-size="12" fill="#4C1D95">h0</text>
+    <line x1="86" y1="253" x2="120" y2="253" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="130" y="258" font-size="12" fill="#111827">block 7</text>
+    <text x="56" y="286" font-size="12" fill="#4C1D95">h1</text>
+    <line x1="86" y1="281" x2="120" y2="281" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="130" y="286" font-size="12" fill="#111827">block 2</text>
+    <text x="56" y="314" font-size="12" fill="#4C1D95">h2</text>
+    <line x1="86" y1="309" x2="120" y2="309" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="130" y="314" font-size="12" fill="#111827">block 5</text>
+    <text x="220" y="286" font-size="11" fill="#6B7280">each entry costs one int</text>
+    <text x="220" y="306" font-size="11" fill="#6B7280">ref_count keeps shared blocks alive</text>
+  </g>
+
+  <!-- request B -->
+  <text x="500" y="230" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#065F46">Request B: same system prompt, different question</text>
+  <g font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif">
+    <rect x="500" y="244" width="96" height="48" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2" stroke-dasharray="5 3"/>
+    <text x="548" y="264" text-anchor="middle" font-size="12" font-weight="700" fill="#065F46">hit block 0</text>
+    <text x="548" y="280" text-anchor="middle" font-size="11" fill="#065F46">reuse KV</text>
+
+    <rect x="608" y="244" width="96" height="48" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2" stroke-dasharray="5 3"/>
+    <text x="656" y="264" text-anchor="middle" font-size="12" font-weight="700" fill="#065F46">hit block 1</text>
+    <text x="656" y="280" text-anchor="middle" font-size="11" fill="#065F46">reuse KV</text>
+
+    <rect x="716" y="244" width="96" height="48" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2" stroke-dasharray="5 3"/>
+    <text x="764" y="264" text-anchor="middle" font-size="12" font-weight="700" fill="#065F46">hit block 2</text>
+    <text x="764" y="280" text-anchor="middle" font-size="11" fill="#065F46">reuse KV</text>
+
+    <rect x="824" y="244" width="104" height="48" rx="8" fill="#DBEAFE" stroke="#2563EB" stroke-width="2"/>
+    <text x="876" y="264" text-anchor="middle" font-size="12" font-weight="700" fill="#1E3A8A">block 3 (new)</text>
+    <text x="876" y="280" text-anchor="middle" font-size="11" fill="#1E3A8A">compute only this</text>
+  </g>
+  <g stroke="#10B981" stroke-width="2" marker-end="url(#arrow-green)">
+    <line x1="456" y1="236" x2="496" y2="250"/>
+    <line x1="456" y1="236" x2="604" y2="250"/>
+    <line x1="456" y1="236" x2="712" y2="250"/>
+  </g>
+
+  <!-- result -->
+  <rect x="500" y="318" width="428" height="86" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+  <text x="516" y="344" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" font-weight="700" fill="#1E3A8A">TTFT saved: (P + Q) / Q</text>
+  <text x="516" y="366" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#111827">P = 48 hit tokens, Q = 16 new tokens in this picture</text>
+  <text x="516" y="388" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#111827">measured with P = 512 / 1024 / 2048: about 2x / 2.5x / 4x on MPS</text>
+
+  <!-- bottom notes -->
+  <rect x="36" y="420" width="420" height="42" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="52" y="447" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#991B1B">Hit lookup stops at the first miss (prefix must be contiguous).</text>
+
+  <rect x="36" y="474" width="892" height="30" rx="8" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2"/>
+  <text x="52" y="495" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#92400E">Shared blocks are read-only: a request may append, but never overwrite; eviction is LRU over blocks with ref_count == 0.</text>
+</svg>

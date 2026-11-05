@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------------------
+# 单卡起 vLLM：docker compose up -d
+#
+# 前置：宿主机已装 NVIDIA 驱动 + nvidia-container-toolkit；
+#      HF 缓存目录有 16GB 以上空间（8B 模型约 16GB）。
+#
+# 常用：
+#   HF_CACHE=$HOME/.cache/huggingface docker compose -f cloud/docker/docker-compose.yml up -d
+#   docker compose -f cloud/docker/docker-compose.yml logs -f
+#   docker compose -f cloud/docker/docker-compose.yml down -v   # 关机 checklist 第 1 步
+#
+# 参数名以 `vllm serve --help` 为准（0.28.x 待核对）；TP>1 时加 --tensor-parallel-size 并把
+# deploy.resources 的 count 改成对应卡数。
+# ---------------------------------------------------------------------------
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.28.0          # 课程锁定版本；拉不到就用 latest 并回填实际版本
+    container_name: vllm-qwen3-8b
+    ports:
+      - "8000:8000"
+    volumes:
+      # 宿主机 HF 缓存（避免每次重下 16GB）；用 HF_CACHE 覆盖成绝对路径
+      - ${HF_CACHE:-./../hf-cache}:/root/.cache/huggingface
+      - ./../results:/workspace/results
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      VLLM_LOGGING_LEVEL: INFO
+    command: >
+      --model Qwen/Qwen3-8B
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len 8192
+      --gpu-memory-utilization 0.90
+      --max-num-seqs 256
+      --max-num-batched-tokens 8192
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --enable-auto-tool-choice
+      --tool-call-parser hermes
+      --structured-outputs-config.backend xgrammar
+    shm_size: "16gb"          # 多卡/大 batch 时 NCCL、共享内存不够会直接挂
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 600s
+    restart: "no"             # 别用 always：实验结束要让它保持停止，避免继续烧卡

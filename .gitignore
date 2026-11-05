@@ -1,0 +1,12 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+outputs/*.png
+outputs/*.csv
+outputs/.mplcache/
+.DS_Store
+outputs/_preview/
+aiinfra_course.egg-info/
+.uv-cache/

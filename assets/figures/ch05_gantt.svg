@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520" role="img" aria-labelledby="ch05-title ch05-desc">
+  <title id="ch05-title">Static batching vs continuous batching on the same arrival sequence</title>
+  <desc id="ch05-desc">Top: static batching runs one batch at a time; short requests idle in their slots while waiting for the longest request, and new requests cannot enter until the whole batch finishes. Bottom: continuous batching revisits the batch every decode step, so freed slots are refilled immediately.</desc>
+
+  <defs>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#10B981"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="520" fill="#FFFFFF"/>
+
+  <g font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif">
+    <text x="36" y="40" font-size="22" font-weight="700" fill="#111827">Same arrival sequence, two scheduling policies</text>
+    <text x="36" y="64" font-size="14" fill="#6B7280">Y: GPU slot (position in batch), X: time. Blue = prefill, green = decode, gray = idle slot</text>
+
+    <!-- ================= top: static batching ================= -->
+    <text x="36" y="100" font-size="16" font-weight="700" fill="#111827">Static batching (request-level)</text>
+    <text x="36" y="120" font-size="13" fill="#6B7280">next batch starts only after the whole batch finishes</text>
+
+    <text x="180" y="136" font-size="12" fill="#F59E0B">padding to the longest prompt</text>
+    <text x="168" y="159" font-size="12" fill="#6B7280" text-anchor="end">slot 0</text>
+    <text x="168" y="191" font-size="12" fill="#6B7280" text-anchor="end">slot 1</text>
+    <text x="168" y="223" font-size="12" fill="#6B7280" text-anchor="end">slot 2</text>
+
+    <!-- batch 1 -->
+    <rect x="180" y="142" width="34" height="24" rx="4" fill="#2563EB"/>
+    <rect x="214" y="142" width="220" height="24" rx="4" fill="#10B981"/>
+    <rect x="180" y="174" width="44" height="24" rx="4" fill="#2563EB"/>
+    <rect x="224" y="174" width="86" height="24" rx="4" fill="#10B981"/>
+    <rect x="310" y="174" width="124" height="24" rx="4" fill="#F3F4F6" stroke="#EF4444" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text x="372" y="191" font-size="11" fill="#EF4444" text-anchor="middle">waiting for longest</text>
+    <rect x="180" y="206" width="62" height="24" rx="4" fill="#2563EB"/>
+    <rect x="242" y="206" width="150" height="24" rx="4" fill="#10B981"/>
+
+    <!-- batch gap -->
+    <rect x="434" y="142" width="72" height="88" rx="6" fill="#FEF2F2" stroke="#EF4444" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text x="470" y="172" font-size="10" fill="#EF4444" text-anchor="middle">new requests</text>
+    <text x="470" y="186" font-size="10" fill="#EF4444" text-anchor="middle">queue here:</text>
+    <text x="470" y="200" font-size="10" fill="#EF4444" text-anchor="middle">batch gap</text>
+
+    <!-- batch 2 -->
+    <rect x="506" y="142" width="34" height="24" rx="4" fill="#2563EB"/>
+    <rect x="540" y="142" width="190" height="24" rx="4" fill="#10B981"/>
+    <rect x="506" y="174" width="44" height="24" rx="4" fill="#2563EB"/>
+    <rect x="550" y="174" width="120" height="24" rx="4" fill="#10B981"/>
+    <rect x="506" y="206" width="62" height="24" rx="4" fill="#2563EB"/>
+    <rect x="568" y="206" width="150" height="24" rx="4" fill="#10B981"/>
+
+    <line x1="180" y1="248" x2="912" y2="248" stroke="#D1D5DB" stroke-width="2" marker-end="url(#arrow-gray)"/>
+    <text x="896" y="264" font-size="12" fill="#6B7280">time</text>
+    <text x="180" y="272" font-size="12" fill="#EF4444">batch 1 is held by its longest request, so batch 2 cannot start: the batch gap</text>
+
+    <!-- ================= bottom: continuous batching ================= -->
+    <text x="36" y="306" font-size="16" font-weight="700" fill="#111827">Continuous batching (iteration-level)</text>
+    <text x="36" y="326" font-size="13" fill="#6B7280">the batch is rebuilt at every decode step</text>
+
+    <text x="36" y="352" font-size="12" fill="#10B981">new requests</text>
+    <text x="36" y="368" font-size="12" fill="#10B981">join immediately</text>
+    <text x="168" y="355" font-size="12" fill="#6B7280" text-anchor="end">slot 0</text>
+    <text x="168" y="387" font-size="12" fill="#6B7280" text-anchor="end">slot 1</text>
+    <text x="168" y="419" font-size="12" fill="#6B7280" text-anchor="end">slot 2</text>
+
+    <path d="M 300 338 L 300 342" stroke="#10B981" stroke-width="2" fill="none" marker-end="url(#arrow-green)"/>
+    <text x="310" y="337" font-size="12" fill="#10B981">slot freed -> next request admitted in the same iteration</text>
+
+    <!-- slot 0 -->
+    <rect x="180" y="342" width="30" height="24" rx="4" fill="#2563EB"/>
+    <rect x="210" y="342" width="230" height="24" rx="4" fill="#10B981"/>
+    <text x="325" y="358" font-size="10" fill="#FFFFFF" text-anchor="middle">req A (long output)</text>
+    <rect x="440" y="342" width="26" height="24" rx="4" fill="#2563EB"/>
+    <rect x="466" y="342" width="150" height="24" rx="4" fill="#10B981"/>
+    <text x="541" y="358" font-size="10" fill="#FFFFFF" text-anchor="middle">req D</text>
+    <rect x="616" y="342" width="26" height="24" rx="4" fill="#2563EB"/>
+    <rect x="642" y="342" width="200" height="24" rx="4" fill="#10B981"/>
+    <text x="742" y="358" font-size="10" fill="#FFFFFF" text-anchor="middle">req G</text>
+
+    <!-- slot 1 -->
+    <rect x="180" y="374" width="26" height="24" rx="4" fill="#2563EB"/>
+    <rect x="206" y="374" width="96" height="24" rx="4" fill="#10B981"/>
+    <text x="254" y="390" font-size="10" fill="#FFFFFF" text-anchor="middle">req B</text>
+    <rect x="302" y="374" width="26" height="24" rx="4" fill="#2563EB"/>
+    <rect x="328" y="374" width="180" height="24" rx="4" fill="#10B981"/>
+    <text x="418" y="390" font-size="10" fill="#FFFFFF" text-anchor="middle">req E</text>
+    <rect x="508" y="374" width="26" height="24" rx="4" fill="#2563EB"/>
+    <rect x="534" y="374" width="150" height="24" rx="4" fill="#10B981"/>
+    <text x="609" y="390" font-size="10" fill="#FFFFFF" text-anchor="middle">req H</text>
+
+    <!-- slot 2 -->
+    <rect x="180" y="406" width="44" height="24" rx="4" fill="#2563EB"/>
+    <rect x="224" y="406" width="120" height="24" rx="4" fill="#10B981"/>
+    <text x="284" y="422" font-size="10" fill="#FFFFFF" text-anchor="middle">req C</text>
+    <rect x="344" y="406" width="26" height="24" rx="4" fill="#2563EB"/>
+    <rect x="370" y="406" width="120" height="24" rx="4" fill="#10B981"/>
+    <text x="430" y="422" font-size="10" fill="#FFFFFF" text-anchor="middle">req F</text>
+    <rect x="490" y="406" width="26" height="24" rx="4" fill="#2563EB"/>
+    <rect x="516" y="406" width="230" height="24" rx="4" fill="#10B981"/>
+    <text x="631" y="422" font-size="10" fill="#FFFFFF" text-anchor="middle">req I (long output)</text>
+
+    <line x1="180" y1="452" x2="912" y2="452" stroke="#D1D5DB" stroke-width="2" marker-end="url(#arrow-gray)"/>
+    <text x="896" y="468" font-size="12" fill="#6B7280">time</text>
+
+    <!-- legend -->
+    <rect x="36" y="490" width="16" height="16" rx="3" fill="#2563EB"/>
+    <text x="58" y="503" font-size="13" fill="#111827">prefill</text>
+    <rect x="130" y="490" width="16" height="16" rx="3" fill="#10B981"/>
+    <text x="152" y="503" font-size="13" fill="#111827">decode</text>
+    <rect x="224" y="490" width="16" height="16" rx="3" fill="#F3F4F6" stroke="#EF4444" stroke-dasharray="4 3"/>
+    <text x="246" y="503" font-size="13" fill="#111827">idle slot (wasted)</text>
+    <text x="400" y="503" font-size="13" fill="#6B7280">Same requests, same GPU: static batching is busy but most slots just tag along</text>
+  </g>
+</svg>

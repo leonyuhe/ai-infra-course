@@ -1,0 +1,12 @@
+# 本地章（00–11）运行时依赖。云上章另见 cloud/README.md
+torch>=2.4,<3
+numpy>=1.26,<3
+pandas>=2.0,<4
+matplotlib>=3.8,<4
+psutil>=5.9,<8
+
+# 构建与验证工具
+nbformat>=5.10
+nbclient>=0.10
+ipykernel>=6.0
+jupyterlab>=4.0

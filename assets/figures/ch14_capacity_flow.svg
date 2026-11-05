@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520">
+  <title>Capacity planning loop: from business SLO to the bill, then back to SLO</title>
+  <desc>Seven-step loop: business SLO, model choice, precision, per-GPU memory ledger, max concurrency, instance count and cost. An SLO check closes the loop: if it fails, go back to model choice or precision and recompute. The output is a plan table with instance count, cost per million tokens and a risk list.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+  </defs>
+  <rect width="960" height="520" fill="#FFFFFF"/>
+  <g font-family="Inter, 'Noto Sans SC', 'DejaVu Sans', sans-serif">
+    <text x="40" y="42" font-size="22" font-weight="700" fill="#111827">Capacity planning: from SLO to the bill, then back to SLO</text>
+    <text x="40" y="68" font-size="13" fill="#6B7280">Every step has a formula; parameterized plan_capacity() in 14.2, 3-plan comparison in 14.3</text>
+
+    <!-- row 1: SLO -> model -> precision -->
+    <rect x="50" y="95" width="250" height="72" rx="8" fill="#F3F4F6" stroke="#2563EB" stroke-width="2"/>
+    <text x="175" y="122" font-size="15" font-weight="700" text-anchor="middle" fill="#2563EB">1. Business SLO</text>
+    <text x="175" y="144" font-size="13" text-anchor="middle" fill="#111827">100 QPS - TTFT p95 &lt;= 500ms</text>
+    <text x="175" y="161" font-size="13" text-anchor="middle" fill="#111827">TPOT &lt;= 50ms - 2K context</text>
+    <line x1="300" y1="131" x2="348" y2="131" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="355" y="95" width="250" height="72" rx="8" fill="#F3F4F6" stroke="#7C3AED" stroke-width="2"/>
+    <text x="480" y="122" font-size="15" font-weight="700" text-anchor="middle" fill="#7C3AED">2. Model choice</text>
+    <text x="480" y="144" font-size="13" text-anchor="middle" fill="#111827">8B / 27B: quality vs memory</text>
+    <text x="480" y="161" font-size="13" text-anchor="middle" fill="#111827">more params = harder to fit</text>
+    <line x1="605" y1="131" x2="653" y2="131" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="660" y="95" width="250" height="72" rx="8" fill="#F3F4F6" stroke="#F59E0B" stroke-width="2"/>
+    <text x="785" y="122" font-size="15" font-weight="700" text-anchor="middle" fill="#F59E0B">3. Precision</text>
+    <text x="785" y="144" font-size="13" text-anchor="middle" fill="#111827">fp16 = 2 B/param, int4 = 0.5 B</text>
+    <text x="785" y="161" font-size="13" text-anchor="middle" fill="#111827">precision buys memory and speed</text>
+    <line x1="785" y1="167" x2="785" y2="228" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <!-- row 2, right to left: ledger -> concurrency -> instances -->
+    <rect x="660" y="235" width="250" height="72" rx="8" fill="#F3F4F6" stroke="#EF4444" stroke-width="2"/>
+    <text x="785" y="262" font-size="15" font-weight="700" text-anchor="middle" fill="#EF4444">4. Per-GPU ledger</text>
+    <text x="785" y="284" font-size="13" text-anchor="middle" fill="#111827">weights + KV cache &lt;= usable VRAM</text>
+    <text x="785" y="301" font-size="13" text-anchor="middle" fill="#111827">the hard wall for every plan</text>
+    <line x1="660" y1="271" x2="612" y2="271" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="355" y="235" width="250" height="72" rx="8" fill="#F3F4F6" stroke="#2563EB" stroke-width="2"/>
+    <text x="480" y="262" font-size="15" font-weight="700" text-anchor="middle" fill="#2563EB">5. Max concurrency</text>
+    <text x="480" y="284" font-size="13" text-anchor="middle" fill="#111827">remaining KV / KV per request</text>
+    <text x="480" y="301" font-size="13" text-anchor="middle" fill="#111827">capped by --max-num-seqs</text>
+    <line x1="355" y1="271" x2="307" y2="271" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="50" y="235" width="250" height="72" rx="8" fill="#F3F4F6" stroke="#7C3AED" stroke-width="2"/>
+    <text x="175" y="262" font-size="15" font-weight="700" text-anchor="middle" fill="#7C3AED">6. Instance count</text>
+    <text x="175" y="284" font-size="13" text-anchor="middle" fill="#111827">ceil(QPS / per-instance QPS)</text>
+    <text x="175" y="301" font-size="13" text-anchor="middle" fill="#111827">keep 20% headroom for bursts</text>
+    <line x1="175" y1="307" x2="175" y2="368" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <!-- row 3: cost -> decision -> output -->
+    <rect x="50" y="375" width="250" height="80" rx="8" fill="#F3F4F6" stroke="#F59E0B" stroke-width="2"/>
+    <text x="175" y="402" font-size="15" font-weight="700" text-anchor="middle" fill="#F59E0B">7. Cost</text>
+    <text x="175" y="424" font-size="13" text-anchor="middle" fill="#111827">instances x price / throughput</text>
+    <text x="175" y="441" font-size="13" text-anchor="middle" fill="#111827">-&gt; USD per million tokens</text>
+    <line x1="300" y1="415" x2="352" y2="415" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <polygon points="480,367 598,415 480,463 362,415" fill="#F59E0B" stroke="#B45309" stroke-width="2"/>
+    <text x="480" y="411" font-size="15" font-weight="700" text-anchor="middle" fill="#111827">SLO met?</text>
+    <text x="480" y="430" font-size="13" text-anchor="middle" fill="#111827">TTFT / TPOT / budget</text>
+    <line x1="598" y1="415" x2="652" y2="415" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="625" y="405" font-size="13" text-anchor="middle" fill="#10B981" font-weight="700">yes</text>
+
+    <rect x="660" y="375" width="250" height="80" rx="8" fill="#F3F4F6" stroke="#10B981" stroke-width="2"/>
+    <text x="785" y="402" font-size="15" font-weight="700" text-anchor="middle" fill="#10B981">Plan table</text>
+    <text x="785" y="424" font-size="13" text-anchor="middle" fill="#111827">instances, USD/M tokens, risks</text>
+    <text x="785" y="441" font-size="13" text-anchor="middle" fill="#111827">plus a load-test acceptance plan</text>
+
+    <!-- no: back to model / precision -->
+    <polyline points="480,367 480,330 325,330 325,131 350,131" fill="none" stroke="#EF4444" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="336" y="352" font-size="13" fill="#EF4444">no: change model or precision, back to 2 / 3</text>
+
+    <text x="40" y="492" font-size="13" fill="#6B7280">Tip: first ask "does it fit on one GPU", then "how many instances"; most plans die at step 4 before step 7.</text>
+  </g>
+</svg>

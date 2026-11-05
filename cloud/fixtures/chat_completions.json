@@ -1,0 +1,411 @@
+{
+  "schema": "vllm-replay/chat_completions@1",
+  "provenance": {
+    "kind": "example-recording",
+    "note": "教学示例录制：字段结构复刻 vLLM 0.28.x 的真实响应，数值为示例量级，不是本机实测。用 cloud/scripts/bench_sweep.sh 在真服务上重录后可替换本文件。",
+    "recorded_at": "2026-11-05",
+    "hardware": "NVIDIA A100 80GB（示例录制）",
+    "vllm_version": "0.28.x",
+    "model": "Qwen/Qwen3-8B",
+    "base_url": "http://127.0.0.1:8000"
+  },
+  "records": [
+    {
+      "case": "basic-chat",
+      "label": "基础对话（单条 user）",
+      "request": {
+        "model": "Qwen/Qwen3-8B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "用一句话解释 PagedAttention。"
+          }
+        ],
+        "max_tokens": 64,
+        "temperature": 0.7
+      },
+      "status_code": 200,
+      "ttft_ms": 168.4,
+      "latency_ms": 2140.0,
+      "response": {
+        "id": "chatcmpl-05b677a8",
+        "object": "chat.completion",
+        "created": 1793836800,
+        "model": "Qwen/Qwen3-8B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "PagedAttention 把 KV cache 切成固定大小的 block，用块表把逻辑位置映射到物理块，从而像操作系统分页一样消除外部碎片并支持共享。"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 18,
+          "completion_tokens": 47,
+          "total_tokens": 65
+        }
+      }
+    },
+    {
+      "case": "long-context",
+      "label": "长上下文（约 6k prompt token）",
+      "request": {
+        "model": "Qwen/Qwen3-8B",
+        "messages": [
+          {
+            "role": "system",
+            "content": "你是推理基础设施课程的助教，回答不超过三句话。"
+          },
+          {
+            "role": "user",
+            "content": "以下是一份 6000 token 的技术文档，请总结 vLLM 的调度器在一步迭代里做哪三件事。"
+          }
+        ],
+        "max_tokens": 128,
+        "temperature": 0.2
+      },
+      "status_code": 200,
+      "ttft_ms": 486.2,
+      "latency_ms": 3820.5,
+      "response": {
+        "id": "chatcmpl-018fcddc",
+        "object": "chat.completion",
+        "created": 1793836800,
+        "model": "Qwen/Qwen3-8B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "① 从 running 队列按 token 预算给每个请求分配 num_scheduled_tokens；② 通过 KV cache manager 分配块，块不足时抢占；③ 把 SchedulerOutput 交给 worker 执行并回收完成请求的块。"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 6104,
+          "completion_tokens": 96,
+          "total_tokens": 6200
+        }
+      }
+    },
+    {
+      "case": "json-schema",
+      "label": "结构化输出（response_format=json_schema）",
+      "request": {
+        "model": "Qwen/Qwen3-8B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "给出 qwen3-8b 在 A100 上的显存估算，输出 JSON。"
+          }
+        ],
+        "max_tokens": 96,
+        "temperature": 0.0,
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": {
+            "name": "mem_estimate",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "model": {
+                  "type": "string"
+                },
+                "weights_gb": {
+                  "type": "number"
+                },
+                "kv_budget_gb": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "model",
+                "weights_gb",
+                "kv_budget_gb"
+              ]
+            }
+          }
+        }
+      },
+      "status_code": 200,
+      "ttft_ms": 172.0,
+      "latency_ms": 1980.3,
+      "response": {
+        "id": "chatcmpl-02f77f84",
+        "object": "chat.completion",
+        "created": 1793836800,
+        "model": "Qwen/Qwen3-8B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "{\"model\": \"qwen3-8b\", \"weights_gb\": 16.4, \"kv_budget_gb\": 55.6}"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 64,
+          "completion_tokens": 38,
+          "total_tokens": 102
+        }
+      }
+    },
+    {
+      "case": "tool-call",
+      "label": "工具调用（tool calling）",
+      "request": {
+        "model": "Qwen/Qwen3-8B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "北京现在天气如何？请调用天气工具。"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "查询城市天气",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              }
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "max_tokens": 96,
+        "temperature": 0.0
+      },
+      "status_code": 200,
+      "ttft_ms": 205.7,
+      "latency_ms": 2240.8,
+      "response": {
+        "id": "chatcmpl-000969d5",
+        "object": "chat.completion",
+        "created": 1793836800,
+        "model": "Qwen/Qwen3-8B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": null,
+              "tool_calls": [
+                {
+                  "id": "call_0",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\": \"北京\"}"
+                  }
+                }
+              ]
+            },
+            "finish_reason": "tool_calls"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 121,
+          "completion_tokens": 42,
+          "total_tokens": 163
+        }
+      }
+    },
+    {
+      "case": "lora-adapter",
+      "label": "LoRA 多适配器（model=qwen3-8b-legal-lora）",
+      "request": {
+        "model": "qwen3-8b-legal-lora",
+        "messages": [
+          {
+            "role": "user",
+            "content": "解释一下合同里的不可抗力条款。"
+          }
+        ],
+        "max_tokens": 96,
+        "temperature": 0.3
+      },
+      "status_code": 200,
+      "ttft_ms": 191.3,
+      "latency_ms": 2360.1,
+      "response": {
+        "id": "chatcmpl-012c7055",
+        "object": "chat.completion",
+        "created": 1793836800,
+        "model": "qwen3-8b-legal-lora",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "不可抗力条款指双方在订立合同时不能预见、不能避免且不能克服的客观情况导致无法履行时，可部分或全部免除责任。"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 88,
+          "completion_tokens": 56,
+          "total_tokens": 144
+        }
+      }
+    },
+    {
+      "case": "temperature-0",
+      "label": "确定性解码（temperature=0）",
+      "request": {
+        "model": "Qwen/Qwen3-8B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "1+1 等于几？只回答数字。"
+          }
+        ],
+        "max_tokens": 16,
+        "temperature": 0.0
+      },
+      "status_code": 200,
+      "ttft_ms": 165.9,
+      "latency_ms": 1740.2,
+      "response": {
+        "id": "chatcmpl-00032cee",
+        "object": "chat.completion",
+        "created": 1793836800,
+        "model": "Qwen/Qwen3-8B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "2"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 30,
+          "total_tokens": 54
+        }
+      }
+    },
+    {
+      "case": "max-tokens",
+      "label": "max_tokens 截断（finish_reason=length）",
+      "request": {
+        "model": "Qwen/Qwen3-8B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "从 1 数到 200。"
+          }
+        ],
+        "max_tokens": 128,
+        "temperature": 0.0
+      },
+      "status_code": 200,
+      "ttft_ms": 170.2,
+      "latency_ms": 4180.6,
+      "response": {
+        "id": "chatcmpl-029a9611",
+        "object": "chat.completion",
+        "created": 1793836800,
+        "model": "Qwen/Qwen3-8B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ..."
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 30,
+          "completion_tokens": 128,
+          "total_tokens": 158
+        }
+      }
+    },
+    {
+      "case": "multilingual",
+      "label": "中英混合输入",
+      "request": {
+        "model": "Qwen/Qwen3-8B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Explain TTFT and TPOT in one sentence each, 中文回答。"
+          }
+        ],
+        "max_tokens": 96,
+        "temperature": 0.6
+      },
+      "status_code": 200,
+      "ttft_ms": 175.5,
+      "latency_ms": 2180.4,
+      "response": {
+        "id": "chatcmpl-044897ca",
+        "object": "chat.completion",
+        "created": 1793836800,
+        "model": "Qwen/Qwen3-8B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "TTFT 是请求发出到第一个 token 返回的时间；TPOT 是首 token 之后平均每个输出 token 的耗时。"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 33,
+          "completion_tokens": 51,
+          "total_tokens": 84
+        }
+      }
+    },
+    {
+      "case": "bad-request-400",
+      "label": "错误请求（max_tokens 超上下文）",
+      "request": {
+        "model": "Qwen/Qwen3-8B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "max_tokens": 32768,
+        "temperature": 0.7
+      },
+      "status_code": 400,
+      "ttft_ms": null,
+      "latency_ms": 12.0,
+      "response": {
+        "error": {
+          "message": "max_tokens 32768 is greater than the maximum model length 8192",
+          "type": "BadRequestError",
+          "code": 400
+        }
+      }
+    }
+  ]
+}

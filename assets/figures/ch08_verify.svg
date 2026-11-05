@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520" role="img" aria-labelledby="t d">
+  <title id="t">Speculative decoding: the draft model guesses, the target model verifies once</title>
+  <desc id="d">A draft model proposes gamma tokens with probabilities p. The target model runs one forward pass over all proposed tokens plus one pending token, producing q for each position. Tokens are accepted left to right with probability min(1, q/p); on the first rejection the cache rolls back and one token is resampled from the normalized residual (q - p)+. If all are accepted, one bonus token is sampled from q.</desc>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#10B981"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#EF4444"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="520" fill="#FFFFFF"/>
+  <text x="40" y="38" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="22" font-weight="700" fill="#111827">Speculative decoding: draft guesses, target verifies once</text>
+  <text x="40" y="64" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" fill="#6B7280">Accept d with prob min(1, q(d)/p(d)); on first reject, resample from (q - p)+ and stop. Output stays exactly q.</text>
+
+  <text x="40" y="96" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#111827">1) draft proposes gamma tokens (cheap)</text>
+  <rect x="40" y="110" width="150" height="60" rx="8" fill="#F3F4F6" stroke="#6B7280" stroke-width="2"/>
+  <text x="115" y="136" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" fill="#111827">context x_1 .. x_L</text>
+  <text x="115" y="156" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#6B7280">already generated</text>
+  <line x1="190" y1="140" x2="218" y2="140" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="220" y="110" width="160" height="60" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+  <text x="300" y="136" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" font-weight="700" fill="#1E40AF">Draft model p</text>
+  <text x="300" y="156" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#1E40AF">autoregressive, cost c</text>
+
+  <g>
+    <line x1="380" y1="140" x2="418" y2="140" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+    <rect x="420" y="110" width="64" height="60" rx="8" fill="#FFFFFF" stroke="#2563EB" stroke-width="2"/>
+    <text x="452" y="134" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#1E40AF">d1</text>
+    <text x="452" y="156" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#6B7280">p1</text>
+    <line x1="484" y1="140" x2="500" y2="140" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+    <rect x="502" y="110" width="64" height="60" rx="8" fill="#FFFFFF" stroke="#2563EB" stroke-width="2"/>
+    <text x="534" y="134" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#1E40AF">d2</text>
+    <text x="534" y="156" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#6B7280">p2</text>
+    <line x1="566" y1="140" x2="582" y2="140" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+    <rect x="584" y="110" width="64" height="60" rx="8" fill="#FFFFFF" stroke="#2563EB" stroke-width="2"/>
+    <text x="616" y="134" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#1E40AF">d3</text>
+    <text x="616" y="156" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#6B7280">p3</text>
+    <line x1="648" y1="140" x2="664" y2="140" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+    <rect x="666" y="110" width="64" height="60" rx="8" fill="#FFFFFF" stroke="#2563EB" stroke-width="2"/>
+    <text x="698" y="134" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#1E40AF">d4</text>
+    <text x="698" y="156" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#6B7280">p4</text>
+  </g>
+  <line x1="452" y1="170" x2="452" y2="213" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="534" y1="170" x2="534" y2="213" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="616" y1="170" x2="616" y2="213" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="698" y1="170" x2="698" y2="213" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+
+  <text x="40" y="208" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#111827">2) target: ONE forward, all positions</text>
+  <rect x="220" y="215" width="510" height="52" rx="8" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2"/>
+  <text x="475" y="238" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" font-weight="700" fill="#5B21B6">Target model q: verify pending + gamma drafts in parallel</text>
+  <text x="475" y="257" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#5B21B6">outputs q1 .. q_gamma plus one bonus distribution q_(gamma+1)</text>
+  <line x1="452" y1="267" x2="452" y2="285" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="534" y1="267" x2="534" y2="285" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="616" y1="267" x2="616" y2="285" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="698" y1="267" x2="698" y2="285" stroke="#6B7280" stroke-width="2" marker-end="url(#arr)"/>
+
+  <text x="40" y="290" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="15" font-weight="700" fill="#111827">3) accept prefix, fix the first reject</text>
+  <rect x="420" y="292" width="64" height="44" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2"/>
+  <text x="452" y="319" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" font-weight="700" fill="#065F46">accept</text>
+  <rect x="502" y="292" width="64" height="44" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2"/>
+  <text x="534" y="319" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" font-weight="700" fill="#065F46">accept</text>
+  <rect x="584" y="292" width="64" height="44" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2"/>
+  <text x="616" y="319" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" font-weight="700" fill="#B91C1C">reject</text>
+  <rect x="666" y="292" width="64" height="44" rx="8" fill="#F9FAFB" stroke="#9CA3AF" stroke-width="2" stroke-dasharray="4,3"/>
+  <text x="698" y="319" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#6B7280">stop</text>
+
+  <text x="40" y="318" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#111827">accept with prob min(1, q_i / p_i)</text>
+  <text x="40" y="338" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#111827">on reject: r ~ (q_i - p_i)+ / sum,</text>
+  <text x="40" y="356" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#111827">roll back KV cache, then stop.</text>
+  <text x="40" y="384" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#6B7280">all accepted: +1 bonus token from q.</text>
+
+  <line x1="616" y1="336" x2="616" y2="355" stroke="#EF4444" stroke-width="2" marker-end="url(#arr-red)"/>
+  <rect x="400" y="357" width="420" height="52" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2"/>
+  <text x="610" y="380" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" font-weight="700" fill="#065F46">output: d1 d2 r   (residual gives back the rejected mass)</text>
+  <text x="610" y="424" text-anchor="middle" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="12" fill="#065F46">r ~ (q3 - p3)+ restores the mass lost at the rejection; all-accepted rounds add 1 bonus token</text>
+
+  <rect x="40" y="430" width="880" height="70" rx="8" fill="#F3F4F6"/>
+  <text x="60" y="458" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" fill="#111827">E[tokens per round] = 1 + a + a^2 + ... + a^g = (1 - a^(g+1)) / (1 - a),    speedup = E[tokens] / (1 + g*c)</text>
+  <text x="60" y="484" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" fill="#6B7280">Same-size draft (a = 1, c = 1) gains nothing; EAGLE / MTP draft heads keep c ~ 0.03-0.1, which is where the speedup comes from.</text>
+</svg>

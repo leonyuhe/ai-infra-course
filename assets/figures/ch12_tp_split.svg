@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520">
+  <title>Three ways to split a model across GPUs: DP, TP, PP</title>
+  <desc>Data parallel replicates the model and all-reduces gradients; tensor parallel splits weights by column/row and all-reduces activations every layer; pipeline parallel splits layers and passes activations point-to-point. The bottom compares NVLink, PCIe and Ethernet bandwidth: fine-grained splitting only works inside the NVLink domain.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+  </defs>
+  <rect width="960" height="520" fill="#FFFFFF"/>
+  <g font-family="Inter, 'Noto Sans SC', 'DejaVu Sans', sans-serif">
+    <text x="40" y="42" font-size="22" font-weight="700" fill="#111827">Multi-GPU parallelism: what do DP / TP / PP each split?</text>
+    <text x="40" y="68" font-size="13" fill="#6B7280">One goal (bigger models, higher throughput) -> three split strategies -> three communication ledgers</text>
+
+    <!-- ================= DP panel ================= -->
+    <rect x="30" y="88" width="270" height="286" rx="8" fill="#F3F4F6" stroke="#2563EB" stroke-width="2"/>
+    <text x="50" y="116" font-size="15" font-weight="700" fill="#2563EB">DP - Data Parallel</text>
+    <text x="50" y="137" font-size="13" fill="#6B7280">replicate model, shard data</text>
+    <rect x="50" y="150" width="90" height="36" rx="8" fill="#FFFFFF" stroke="#2563EB" stroke-width="2"/>
+    <text x="95" y="173" font-size="13" text-anchor="middle" fill="#111827">rank0 copy</text>
+    <rect x="150" y="150" width="90" height="36" rx="8" fill="#FFFFFF" stroke="#2563EB" stroke-width="2"/>
+    <text x="195" y="173" font-size="13" text-anchor="middle" fill="#111827">rank1 copy</text>
+    <rect x="50" y="196" width="90" height="36" rx="8" fill="#FFFFFF" stroke="#2563EB" stroke-width="2"/>
+    <text x="95" y="219" font-size="13" text-anchor="middle" fill="#111827">rank2 copy</text>
+    <rect x="150" y="196" width="90" height="36" rx="8" fill="#FFFFFF" stroke="#2563EB" stroke-width="2"/>
+    <text x="195" y="219" font-size="13" text-anchor="middle" fill="#111827">rank3 copy</text>
+    <rect x="50" y="246" width="190" height="32" rx="8" fill="#FFFFFF" stroke="#7C3AED" stroke-width="2"/>
+    <text x="145" y="267" font-size="13" text-anchor="middle" fill="#111827">batch split into 4 shards</text>
+    <line x1="145" y1="278" x2="145" y2="296" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="50" y="298" width="190" height="42" rx="8" fill="#7C3AED"/>
+    <text x="145" y="315" font-size="13" text-anchor="middle" fill="#FFFFFF">gradient all-reduce (avg)</text>
+    <text x="145" y="332" font-size="13" text-anchor="middle" fill="#FFFFFF">once per step</text>
+    <text x="50" y="360" font-size="13" fill="#6B7280">no memory saving: full model per GPU</text>
+    <text x="50" y="378" font-size="13" fill="#6B7280">comm grows with params x 4B</text>
+
+    <!-- ================= TP panel ================= -->
+    <rect x="330" y="88" width="300" height="286" rx="8" fill="#F3F4F6" stroke="#7C3AED" stroke-width="2"/>
+    <text x="350" y="116" font-size="15" font-weight="700" fill="#7C3AED">TP - Tensor Parallel</text>
+    <text x="350" y="137" font-size="13" fill="#6B7280">split weights by column / row; all-reduce per layer</text>
+    <text x="350" y="160" font-size="13" fill="#111827">One Linear weight W:</text>
+    <rect x="350" y="168" width="130" height="66" rx="8" fill="#2563EB"/>
+    <text x="415" y="196" font-size="13" text-anchor="middle" fill="#FFFFFF">W col shard 0</text>
+    <text x="415" y="216" font-size="13" text-anchor="middle" fill="#FFFFFF">held by rank0</text>
+    <rect x="480" y="168" width="130" height="66" rx="8" fill="#7C3AED"/>
+    <text x="545" y="196" font-size="13" text-anchor="middle" fill="#FFFFFF">W col shard 1</text>
+    <text x="545" y="216" font-size="13" text-anchor="middle" fill="#FFFFFF">held by rank1</text>
+    <line x1="415" y1="234" x2="430" y2="276" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+    <line x1="545" y1="234" x2="530" y2="276" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="370" y="278" width="220" height="42" rx="8" fill="#F59E0B"/>
+    <text x="480" y="295" font-size="13" text-anchor="middle" fill="#111827">all-reduce sum (2x per layer)</text>
+    <text x="480" y="312" font-size="13" text-anchor="middle" fill="#111827">comm grows with activations x dtype</text>
+    <text x="350" y="348" font-size="13" fill="#6B7280">memory / TP; heads must divide TP</text>
+    <text x="350" y="366" font-size="13" fill="#6B7280">latency grows with TP; amortized by batch</text>
+
+    <!-- ================= PP panel ================= -->
+    <rect x="660" y="88" width="270" height="286" rx="8" fill="#F3F4F6" stroke="#10B981" stroke-width="2"/>
+    <text x="680" y="116" font-size="15" font-weight="700" fill="#10B981">PP - Pipeline Parallel</text>
+    <text x="680" y="137" font-size="13" fill="#6B7280">split by layers; pass activations at boundaries</text>
+    <rect x="680" y="150" width="110" height="120" rx="8" fill="#FFFFFF" stroke="#10B981" stroke-width="2"/>
+    <text x="735" y="172" font-size="13" text-anchor="middle" fill="#10B981">stage0</text>
+    <text x="735" y="194" font-size="13" text-anchor="middle" fill="#111827">L0</text>
+    <text x="735" y="214" font-size="13" text-anchor="middle" fill="#111827">L1</text>
+    <text x="735" y="234" font-size="13" text-anchor="middle" fill="#111827">L2</text>
+    <text x="735" y="254" font-size="13" text-anchor="middle" fill="#111827">L3</text>
+    <rect x="810" y="150" width="110" height="120" rx="8" fill="#FFFFFF" stroke="#10B981" stroke-width="2"/>
+    <text x="865" y="172" font-size="13" text-anchor="middle" fill="#10B981">stage1</text>
+    <text x="865" y="194" font-size="13" text-anchor="middle" fill="#111827">L4</text>
+    <text x="865" y="214" font-size="13" text-anchor="middle" fill="#111827">L5</text>
+    <text x="865" y="234" font-size="13" text-anchor="middle" fill="#111827">L6</text>
+    <text x="865" y="254" font-size="13" text-anchor="middle" fill="#111827">L7</text>
+    <line x1="790" y1="210" x2="808" y2="210" stroke="#6B7280" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="800" y="200" font-size="13" text-anchor="middle" fill="#6B7280">P2P</text>
+    <text x="680" y="300" font-size="13" fill="#111827">bubble = (PP-1) / (microbatch + PP-1)</text>
+    <text x="680" y="322" font-size="13" fill="#6B7280">memory / PP; cost: pipeline idle time</text>
+    <text x="680" y="344" font-size="13" fill="#6B7280">works across nodes; small comm</text>
+
+    <!-- ================= bandwidth comparison ================= -->
+    <text x="40" y="412" font-size="15" font-weight="700" fill="#111827">Interconnect bandwidth decides how fine you can split</text>
+    <text x="190" y="440" font-size="13" text-anchor="end" fill="#111827">NVLink 4</text>
+    <rect x="200" y="426" width="600" height="16" rx="8" fill="#2563EB"/>
+    <text x="810" y="440" font-size="13" fill="#2563EB">900 GB/s (8 GPUs in one node)</text>
+    <text x="190" y="466" font-size="13" text-anchor="end" fill="#111827">PCIe Gen4</text>
+    <rect x="200" y="452" width="43" height="16" rx="8" fill="#F59E0B"/>
+    <text x="253" y="466" font-size="13" fill="#F59E0B">64 GB/s</text>
+    <text x="190" y="492" font-size="13" text-anchor="end" fill="#111827">Ethernet</text>
+    <rect x="200" y="478" width="17" height="16" rx="8" fill="#EF4444"/>
+    <text x="227" y="492" font-size="13" fill="#EF4444">25 GB/s</text>
+    <text x="530" y="492" font-size="13" fill="#6B7280">TP only within the NVLink domain; DP / PP across nodes</text>
+  </g>
+</svg>

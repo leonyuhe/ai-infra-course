@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" width="960" height="600" role="img" aria-labelledby="t d">
+  <title id="t">Lifecycle of a request in vLLM</title>
+  <desc id="d">Sequence diagram: Client, API Server, EngineCore, Scheduler, KVCacheManager, Worker, OutputProcessor. It covers admission, prefill, decode, preemption and finish.</desc>
+  <defs>
+    <marker id="seq-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#374151"/>
+    </marker>
+    <marker id="seq-arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#10B981"/>
+    </marker>
+    <marker id="seq-arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#EF4444"/>
+    </marker>
+    <marker id="seq-arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7C3AED"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="600" fill="#FFFFFF"/>
+  <text x="30" y="36" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="700" fill="#111827">Lifecycle of a request: admission -&gt; prefill -&gt; decode -&gt; finish</text>
+  <text x="30" y="58" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#6B7280">Vertical axis = components, horizontal = time; the red branch is preemption when KV blocks run out</text>
+
+  <!-- lifelines -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="15" y="80" width="130" height="44" rx="8" fill="#F3F4F6" stroke="#9CA3AF" stroke-width="2"/>
+    <text x="80" y="107" text-anchor="middle" font-size="13" font-weight="700" fill="#111827">Client</text>
+
+    <rect x="140" y="80" width="130" height="44" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="205" y="100" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1E3A8A">API Server</text>
+    <text x="205" y="116" text-anchor="middle" font-size="10.5" fill="#4B5563">OpenAI layer</text>
+
+    <rect x="265" y="80" width="130" height="44" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="330" y="100" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1E3A8A">EngineCore</text>
+    <text x="330" y="116" text-anchor="middle" font-size="10.5" fill="#4B5563">Processor</text>
+
+    <rect x="390" y="80" width="130" height="44" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="455" y="100" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1E3A8A">Scheduler</text>
+    <text x="455" y="116" text-anchor="middle" font-size="10.5" fill="#4B5563">queues + token budget</text>
+
+    <rect x="515" y="80" width="130" height="44" rx="8" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2"/>
+    <text x="580" y="100" text-anchor="middle" font-size="12.5" font-weight="700" fill="#4C1D95">KVCacheManager</text>
+    <text x="580" y="116" text-anchor="middle" font-size="10.5" fill="#4B5563">BlockPool</text>
+
+    <rect x="640" y="80" width="130" height="44" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="705" y="100" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1E3A8A">Worker</text>
+    <text x="705" y="116" text-anchor="middle" font-size="10.5" fill="#4B5563">ModelRunner</text>
+
+    <rect x="765" y="80" width="130" height="44" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="830" y="100" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1E3A8A">OutputProcessor</text>
+    <text x="830" y="116" text-anchor="middle" font-size="10.5" fill="#4B5563">detokenize</text>
+  </g>
+
+  <g stroke="#D1D5DB" stroke-width="1.5" stroke-dasharray="5 5">
+    <line x1="80" y1="124" x2="80" y2="566"/>
+    <line x1="205" y1="124" x2="205" y2="566"/>
+    <line x1="330" y1="124" x2="330" y2="566"/>
+    <line x1="455" y1="124" x2="455" y2="566"/>
+    <line x1="580" y1="124" x2="580" y2="566"/>
+    <line x1="705" y1="124" x2="705" y2="566"/>
+    <line x1="830" y1="124" x2="830" y2="566"/>
+  </g>
+
+  <!-- phase tags -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="11" fill="#9CA3AF">
+    <text x="26" y="215" transform="rotate(-90 26 215)" text-anchor="middle">admission</text>
+    <text x="26" y="280" transform="rotate(-90 26 280)" text-anchor="middle">prefill</text>
+    <text x="26" y="400" transform="rotate(-90 26 400)" text-anchor="middle">decode</text>
+    <text x="26" y="505" transform="rotate(-90 26 505)" text-anchor="middle">finish</text>
+  </g>
+
+  <!-- request / scheduling messages -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="11.5" fill="#111827">
+    <g stroke="#374151" stroke-width="2" marker-end="url(#seq-arrow)">
+      <line x1="80" y1="148" x2="201" y2="148"/>
+      <line x1="205" y1="178" x2="326" y2="178"/>
+      <line x1="330" y1="210" x2="451" y2="210"/>
+      <line x1="455" y1="272" x2="701" y2="272"/>
+      <line x1="455" y1="370" x2="701" y2="370"/>
+    </g>
+    <g stroke="#7C3AED" stroke-width="2" marker-end="url(#seq-arrow-purple)">
+      <line x1="455" y1="240" x2="576" y2="240"/>
+    </g>
+    <g stroke="#10B981" stroke-width="2" marker-end="url(#seq-arrow-green)">
+      <line x1="705" y1="306" x2="826" y2="306"/>
+      <line x1="705" y1="486" x2="826" y2="486"/>
+      <line x1="455" y1="512" x2="576" y2="512"/>
+    </g>
+    <g stroke="#EF4444" stroke-width="2" marker-end="url(#seq-arrow-red)">
+      <line x1="455" y1="424" x2="576" y2="424"/>
+    </g>
+
+    <text x="140" y="143" text-anchor="middle" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">POST /v1/chat/completions</text>
+    <text x="265" y="173" text-anchor="middle" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">add_request(): tokenize</text>
+    <text x="390" y="205" text-anchor="middle" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">schedule(): admit into waiting</text>
+    <text x="515" y="235" text-anchor="middle" fill="#4C1D95" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">allocate_slots()</text>
+    <text x="580" y="266" text-anchor="middle" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">SchedulerOutput: prefill the prompt</text>
+    <text x="765" y="301" text-anchor="middle" fill="#047857" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">sample first token (TTFT)</text>
+    <text x="580" y="364" text-anchor="middle" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">decode: 1 token/request per step, mixed batch</text>
+    <text x="580" y="418" text-anchor="middle" fill="#B91C1C" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">no blocks left -&gt; preempt: free + recompute</text>
+    <text x="765" y="481" text-anchor="middle" fill="#047857" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">last token (finish_reason)</text>
+    <text x="515" y="507" text-anchor="middle" fill="#047857" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">free blocks</text>
+  </g>
+
+  <!-- preempted blocks returned to scheduler -->
+  <g stroke="#EF4444" stroke-width="1.8" stroke-dasharray="6 4">
+    <line x1="576" y1="448" x2="459" y2="448" marker-end="url(#seq-arrow-red)"/>
+  </g>
+  <text x="517" y="443" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="10.5" fill="#B91C1C" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">blocks released, request goes back to waiting (recompute)</text>
+
+  <!-- SSE replies back to client -->
+  <g stroke="#10B981" stroke-width="1.8" stroke-dasharray="6 4">
+    <path d="M 830 334 L 84 334" fill="none" marker-end="url(#seq-arrow-green)"/>
+    <path d="M 830 540 L 84 540" fill="none" marker-end="url(#seq-arrow-green)"/>
+  </g>
+  <text x="455" y="329" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="11" fill="#047857" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">SSE stream: first token (client-side TTFT)</text>
+  <text x="455" y="535" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="11" fill="#047857" stroke="#FFFFFF" stroke-width="4" paint-order="stroke">SSE: [DONE], stream ends; request removed from running and block table</text>
+
+  <!-- loop frame -->
+  <rect x="395" y="350" width="330" height="40" rx="6" fill="none" stroke="#9CA3AF" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="562" y="381" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="10.5" fill="#6B7280">loop until finish: token budget sizes the mixed batch</text>
+
+  <rect x="30" y="566" width="900" height="26" rx="6" fill="#F3F4F6"/>
+  <text x="44" y="584" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#374151">
+    One request = 1 prefill + N decode steps; new requests join at every iteration, so TTFT and TPOT pull against each other.
+  </text>
+</svg>

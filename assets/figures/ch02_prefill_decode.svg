@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520" role="img" aria-labelledby="t d">
+  <title id="t">KV cache: prefill once, then one token per step</title>
+  <desc id="d">Two timelines compared. Naive generation recomputes the whole sequence at every step growing with context. KV cache prefills the prompt once and then only computes one new token per decode step.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#EF4444"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#10B981"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="520" fill="#FFFFFF"/>
+
+  <text x="36" y="44" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="22" font-weight="700" fill="#111827">KV cache: prefill once, then one token per step</text>
+  <text x="36" y="70" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="14" fill="#6B7280">Same prompt (S tokens) and the same 4 generated tokens, two different amounts of work</text>
+
+  <!-- naive timeline -->
+  <text x="36" y="112" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="16" font-weight="700" fill="#991B1B">Naive generation: recompute the full sequence every step</text>
+  <g font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif">
+    <text x="36" y="150" font-size="13" fill="#374151">step 1</text>
+    <rect x="130" y="132" width="150" height="30" rx="6" fill="#FEE2E2" stroke="#EF4444" stroke-width="2"/>
+    <text x="205" y="152" text-anchor="middle" font-size="12" fill="#991B1B">S tokens</text>
+    <text x="300" y="152" font-size="12" fill="#6B7280">forward S</text>
+
+    <text x="36" y="196" font-size="13" fill="#374151">step 2</text>
+    <rect x="130" y="178" width="220" height="30" rx="6" fill="#FEE2E2" stroke="#EF4444" stroke-width="2"/>
+    <text x="240" y="198" text-anchor="middle" font-size="12" fill="#991B1B">S + 1 tokens, prefix recomputed</text>
+    <text x="370" y="198" font-size="12" fill="#6B7280">forward S+1</text>
+
+    <text x="36" y="242" font-size="13" fill="#374151">step 3</text>
+    <rect x="130" y="224" width="290" height="30" rx="6" fill="#FEE2E2" stroke="#EF4444" stroke-width="2"/>
+    <text x="275" y="244" text-anchor="middle" font-size="12" fill="#991B1B">S + 2 tokens, prefix recomputed again</text>
+    <text x="440" y="244" font-size="12" fill="#6B7280">forward S+2</text>
+
+    <text x="36" y="288" font-size="13" fill="#374151">step 4</text>
+    <rect x="130" y="270" width="360" height="30" rx="6" fill="#FEE2E2" stroke="#EF4444" stroke-width="2"/>
+    <text x="310" y="290" text-anchor="middle" font-size="12" fill="#991B1B">S + 3 tokens, prefix recomputed again</text>
+    <text x="510" y="290" font-size="12" fill="#6B7280">forward S+3</text>
+  </g>
+  <text x="620" y="242" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#EF4444">total attention work ~ O(T x (S+T))</text>
+
+  <!-- kv cache timeline -->
+  <text x="36" y="336" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="16" font-weight="700" fill="#065F46">KV cache: prefill once, then decode one token per step</text>
+  <g font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif">
+    <text x="36" y="376" font-size="13" fill="#374151">prefill</text>
+    <rect x="130" y="358" width="150" height="30" rx="6" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="205" y="378" text-anchor="middle" font-size="12" fill="#1E3A8A">S tokens, one pass</text>
+    <text x="300" y="378" font-size="12" fill="#6B7280">compute + store K/V</text>
+
+    <text x="36" y="420" font-size="13" fill="#374151">decode</text>
+    <rect x="130" y="402" width="42" height="30" rx="6" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <rect x="182" y="402" width="42" height="30" rx="6" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <rect x="234" y="402" width="42" height="30" rx="6" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <rect x="286" y="402" width="42" height="30" rx="6" fill="#D1FAE5" stroke="#10B981" stroke-width="2"/>
+    <text x="151" y="422" text-anchor="middle" font-size="11" fill="#065F46">1 tok</text>
+    <text x="203" y="422" text-anchor="middle" font-size="11" fill="#065F46">1 tok</text>
+    <text x="255" y="422" text-anchor="middle" font-size="11" fill="#065F46">1 tok</text>
+    <text x="307" y="422" text-anchor="middle" font-size="11" fill="#065F46">1 tok</text>
+    <text x="350" y="422" font-size="12" fill="#6B7280">each step reads the cached K/V, computes 1 query</text>
+  </g>
+  <text x="620" y="400" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#10B981">total work ~ O(S + T)</text>
+
+  <!-- conclusion -->
+  <rect x="36" y="452" width="888" height="46" rx="8" fill="#F3F4F6"/>
+  <text x="52" y="480" font-family="Inter, 'PingFang SC', 'Noto Sans SC', sans-serif" font-size="13" fill="#111827">Trade one O(T x (S+T)) computation for O(S + T): the price is KV cache memory, which grows linearly with context length and batch size.</text>
+</svg>

@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560" role="img" aria-labelledby="t d">
+  <title id="t">vLLM deployment topology: local vllm-metal vs cloud Docker with TP=4</title>
+  <desc id="d">Two deployment topologies. Left: a Mac running vllm-metal with HF cache, LoRA adapters and a separate embeddings instance. Right: A100/H100 on the cloud running vLLM in Docker with four TP workers, Prometheus metrics and a shutdown checklist.</desc>
+  <defs>
+    <marker id="top-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+    <marker id="top-arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7C3AED"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="560" fill="#FFFFFF"/>
+  <text x="30" y="38" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="700" fill="#111827">Deployment topology: one command on a Mac, Docker with TP=4 on the cloud</text>
+  <text x="30" y="60" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#6B7280">Both sides expose the same OpenAI-compatible API and share the same bench scripts; only worker count differs</text>
+
+  <!-- ================= left panel ================= -->
+  <rect x="20" y="74" width="440" height="392" rx="10" fill="#F9FAFB" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="38" y="100" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="700" fill="#111827">Local: Mac + vllm-metal (single node / Metal)</text>
+
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="38" y="120" width="170" height="44" rx="8" fill="#F3F4F6" stroke="#9CA3AF" stroke-width="2"/>
+    <text x="123" y="147" text-anchor="middle" font-size="12.5" font-weight="700" fill="#111827">Client (curl / SDK)</text>
+
+    <rect x="38" y="182" width="170" height="54" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="123" y="206" text-anchor="middle" font-size="13" font-weight="700" fill="#1E3A8A">API Server :8000</text>
+    <text x="123" y="224" text-anchor="middle" font-size="11" fill="#4B5563">OpenAI-compatible</text>
+
+    <rect x="38" y="254" width="170" height="44" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="123" y="281" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1E3A8A">EngineCore</text>
+
+    <rect x="38" y="316" width="170" height="44" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="123" y="343" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1E3A8A">Metal Worker (MPS)</text>
+
+    <rect x="232" y="120" width="200" height="44" rx="8" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2"/>
+    <text x="332" y="139" text-anchor="middle" font-size="12" font-weight="700" fill="#4C1D95">HF cache</text>
+    <text x="332" y="155" text-anchor="middle" font-size="10.5" fill="#4B5563">~/.cache/huggingface</text>
+
+    <rect x="232" y="182" width="200" height="54" rx="8" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2"/>
+    <text x="332" y="204" text-anchor="middle" font-size="12" font-weight="700" fill="#4C1D95">LoRA adapters</text>
+    <text x="332" y="222" text-anchor="middle" font-size="10.5" fill="#4B5563">--enable-lora</text>
+
+    <rect x="232" y="254" width="200" height="54" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2"/>
+    <text x="332" y="276" text-anchor="middle" font-size="12" font-weight="700" fill="#047857">Embeddings :8001</text>
+    <text x="332" y="294" text-anchor="middle" font-size="10.5" fill="#4B5563">--task embed (separate process)</text>
+
+    <rect x="232" y="316" width="200" height="44" rx="8" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2"/>
+    <text x="332" y="343" text-anchor="middle" font-size="12" font-weight="700" fill="#92400E">Logs / metrics (optional)</text>
+  </g>
+
+  <g stroke="#6B7280" stroke-width="2" marker-end="url(#top-arrow)">
+    <line x1="123" y1="164" x2="123" y2="178"/>
+    <line x1="123" y1="236" x2="123" y2="250"/>
+    <line x1="123" y1="298" x2="123" y2="312"/>
+  </g>
+  <g stroke="#7C3AED" stroke-width="1.8" stroke-dasharray="6 4" fill="none">
+    <path d="M 232 142 L 212 142 L 212 270" marker-end="url(#top-arrow-purple)"/>
+    <path d="M 232 209 L 212 209" marker-end="url(#top-arrow-purple)"/>
+  </g>
+
+  <rect x="38" y="378" width="404" height="26" rx="6" fill="#F3F4F6"/>
+  <text x="48" y="396" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="10.5" fill="#111827">brew tap vllm-project/vllm-metal &amp;&amp; brew install vllm-metal</text>
+  <rect x="38" y="410" width="404" height="26" rx="6" fill="#F3F4F6"/>
+  <text x="48" y="428" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="10.5" fill="#111827">vllm serve Qwen/Qwen3-8B --max-model-len 4096 --port 8000</text>
+  <text x="38" y="454" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="10.5" fill="#6B7280">Real commands follow the vllm-metal tap README (version to verify)</text>
+
+  <!-- ================= right panel ================= -->
+  <rect x="500" y="74" width="440" height="392" rx="10" fill="#F9FAFB" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="518" y="100" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="700" fill="#111827">Cloud: A100/H100 + Docker (multi-GPU TP)</text>
+
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="518" y="120" width="170" height="44" rx="8" fill="#F3F4F6" stroke="#9CA3AF" stroke-width="2"/>
+    <text x="603" y="147" text-anchor="middle" font-size="12.5" font-weight="700" fill="#111827">Bench client / load gen</text>
+
+    <rect x="518" y="182" width="170" height="54" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="603" y="206" text-anchor="middle" font-size="13" font-weight="700" fill="#1E3A8A">Host :8000</text>
+    <text x="603" y="224" text-anchor="middle" font-size="10.5" fill="#4B5563">-p 8000:8000</text>
+
+    <rect x="518" y="254" width="170" height="54" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="603" y="276" text-anchor="middle" font-size="13" font-weight="700" fill="#1E3A8A">vLLM container</text>
+    <text x="603" y="294" text-anchor="middle" font-size="10.5" fill="#4B5563">API + EngineCore</text>
+
+    <rect x="518" y="326" width="84" height="40" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="560" y="345" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1E3A8A">Worker0</text>
+    <text x="560" y="359" text-anchor="middle" font-size="9" fill="#4B5563">GPU 0</text>
+    <rect x="606" y="326" width="84" height="40" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="648" y="345" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1E3A8A">Worker1</text>
+    <text x="648" y="359" text-anchor="middle" font-size="9" fill="#4B5563">GPU 1</text>
+    <rect x="694" y="326" width="84" height="40" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="736" y="345" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1E3A8A">Worker2</text>
+    <text x="736" y="359" text-anchor="middle" font-size="9" fill="#4B5563">GPU 2</text>
+    <rect x="782" y="326" width="84" height="40" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="824" y="345" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1E3A8A">Worker3</text>
+    <text x="824" y="359" text-anchor="middle" font-size="9" fill="#4B5563">GPU 3</text>
+
+    <rect x="710" y="120" width="212" height="44" rx="8" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2"/>
+    <text x="816" y="139" text-anchor="middle" font-size="12" font-weight="700" fill="#4C1D95">HF cache volume</text>
+    <text x="816" y="155" text-anchor="middle" font-size="10.5" fill="#4B5563">/root/.cache/huggingface</text>
+
+    <rect x="710" y="176" width="212" height="44" rx="8" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2"/>
+    <text x="816" y="195" text-anchor="middle" font-size="12" font-weight="700" fill="#92400E">Prometheus metrics</text>
+    <text x="816" y="211" text-anchor="middle" font-size="10.5" fill="#4B5563">:8000/metrics and vllm:* gauges</text>
+
+    <rect x="710" y="232" width="212" height="54" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2"/>
+    <text x="816" y="254" text-anchor="middle" font-size="12" font-weight="700" fill="#047857">LoRA / Embeddings</text>
+    <text x="816" y="272" text-anchor="middle" font-size="10.5" fill="#4B5563">one instance per task or GPU</text>
+  </g>
+
+  <g stroke="#6B7280" stroke-width="2" marker-end="url(#top-arrow)">
+    <line x1="603" y1="164" x2="603" y2="178"/>
+    <line x1="603" y1="236" x2="603" y2="250"/>
+  </g>
+  <g stroke="#6B7280" stroke-width="2" fill="none" marker-end="url(#top-arrow)">
+    <path d="M 603 308 L 603 317 M 560 317 L 824 317"/>
+    <line x1="560" y1="317" x2="560" y2="322"/>
+    <line x1="648" y1="317" x2="648" y2="322"/>
+    <line x1="736" y1="317" x2="736" y2="322"/>
+    <line x1="824" y1="317" x2="824" y2="322"/>
+  </g>
+  <g stroke="#7C3AED" stroke-width="1.8" stroke-dasharray="6 4" fill="none">
+    <path d="M 688 262 L 710 240" marker-end="url(#top-arrow-purple)"/>
+    <path d="M 688 284 L 710 200" marker-end="url(#top-arrow-purple)"/>
+  </g>
+
+  <rect x="518" y="378" width="404" height="26" rx="6" fill="#F3F4F6"/>
+  <text x="528" y="396" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="10.5" fill="#111827">docker compose up -d  -&gt;  bash scripts/bench_sweep.sh  -&gt;  docker compose down</text>
+  <rect x="518" y="410" width="404" height="26" rx="6" fill="#F3F4F6"/>
+  <text x="528" y="428" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="10.5" fill="#111827">vllm serve Qwen/Qwen3-8B --tensor-parallel-size 4</text>
+  <text x="518" y="454" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="10.5" fill="#6B7280">Bench results land in cloud/results/ and can be replayed as fixtures</text>
+
+  <!-- shutdown callout -->
+  <rect x="20" y="480" width="920" height="64" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2"/>
+  <text x="38" y="505" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#991B1B">WARNING: shutdown checklist (skip one step and you keep paying)</text>
+  <text x="38" y="528" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="11.5" fill="#7F1D1D">
+    docker compose down -v  -&gt;  platform console shutdown  -&gt;  check billing. RunPod "Stop" still bills storage; use "Terminate".
+  </text>
+</svg>

@@ -1,0 +1,130 @@
+{
+  "schema": "vllm-replay/embeddings@1",
+  "provenance": {
+    "kind": "example-recording",
+    "note": "示例录制；向量已截断到 16 维（真实模型为 1024/1536 维），只用于演示接口形状，不能用于相似度结论。",
+    "recorded_at": "2026-11-05",
+    "hardware": "NVIDIA A100 80GB（示例录制）",
+    "vllm_version": "0.28.x",
+    "model": "Qwen/Qwen3-Embedding-0.6B",
+    "base_url": "http://127.0.0.1:8000"
+  },
+  "embedding_dim": 16,
+  "endpoint": "/v1/embeddings",
+  "records": [
+    {
+      "case": "embed-0",
+      "input": "vLLM 的 PagedAttention 是什么？",
+      "status_code": 200,
+      "latency_ms": 38.2,
+      "response": {
+        "object": "list",
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "data": [
+          {
+            "object": "embedding",
+            "index": 0,
+            "embedding": [
+              1.6905,
+              -0.4659,
+              0.0328,
+              0.4075,
+              -0.7889,
+              0.0021,
+              -0.0009,
+              -1.7547,
+              1.0177,
+              0.6005,
+              -0.6254,
+              -0.1715,
+              0.5053,
+              -0.2614,
+              -0.2427,
+              -1.4532
+            ]
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 12,
+          "total_tokens": 12
+        }
+      }
+    },
+    {
+      "case": "embed-1",
+      "input": "什么是连续批处理（continuous batching）？",
+      "status_code": 200,
+      "latency_ms": 42.3,
+      "response": {
+        "object": "list",
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "data": [
+          {
+            "object": "embedding",
+            "index": 1,
+            "embedding": [
+              0.5546,
+              0.1239,
+              0.2745,
+              -1.5265,
+              1.6507,
+              0.1543,
+              -0.3871,
+              2.0291,
+              -0.0454,
+              -1.4507,
+              -0.4052,
+              -2.2883,
+              1.0494,
+              -0.4165,
+              -0.7426,
+              1.0725
+            ]
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 15,
+          "total_tokens": 15
+        }
+      }
+    },
+    {
+      "case": "embed-2",
+      "input": "A100 80GB 能放多少个 8B 模型的 KV cache？",
+      "status_code": 200,
+      "latency_ms": 46.4,
+      "response": {
+        "object": "list",
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "data": [
+          {
+            "object": "embedding",
+            "index": 2,
+            "embedding": [
+              -1.6511,
+              0.5354,
+              -2.0644,
+              -0.6622,
+              -1.2042,
+              1.462,
+              1.7662,
+              -0.3294,
+              0.8407,
+              -0.18,
+              0.5681,
+              -0.7528,
+              -1.7083,
+              -1.8031,
+              0.3831,
+              2.2476
+            ]
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 18,
+          "total_tokens": 18
+        }
+      }
+    }
+  ]
+}
