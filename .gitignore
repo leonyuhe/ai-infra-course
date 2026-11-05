@@ -10,3 +10,4 @@ outputs/.mplcache/
 outputs/_preview/
 aiinfra_course.egg-info/
 .uv-cache/
+.ghconfig/

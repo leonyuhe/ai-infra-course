@@ -106,4 +106,4 @@ outputs/            Notebook 运行生成的图表（gitignore）
 
 ## 许可
 
-课程内容供内部培训使用；代码示例可自由修改。
+代码以 [MIT License](LICENSE) 发布；课程文档（Notebook 正文、图表）建议署名后使用。
