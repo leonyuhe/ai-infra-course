@@ -92,15 +92,34 @@
 # ```
 
 # %% [markdown]
-# 这个公式会用两种方式验证，02.3 的表格会同时给出三列：
+# ### 用两个方向对账
 #
-# 1. **正向验证**：按公式算出的字节数，必须等于缓存里所有 K/V 张量的 `t.nbytes` 之和。
-#    `t.nbytes` 是 PyTorch 张量**实际占用**的字节数（`numel × element_size`），
-#    对上了就说明公式没有漏项；
-# 2. **反向验证**：只给总字节数、层数、头数、维度、batch、dtype，反解
-#    `S = 字节数 ÷ (2·L·H·D·B·dtype_bytes)`，结果必须等于构造缓存时传入的 `seq_len`。
+# 公式写出来容易，但很容易漏项。所以用一个**能精确测量**的小缓存来对账：
+# 先用具体张量把公式推一遍，再从两个方向各核对一次。
 #
-# 一个公式正反都能对上，才说明真的理解了它的每一项，而不是背下来的。
+# 先看**一个** K 张量（TinyGPT，B=1, S=4096, fp32）：
+#
+# - 形状：`(B, H, S, D) = (1, 4, 4096, 64)`
+# - 元素数：`1 × 4 × 4096 × 64 = 1,048,576`
+# - 字节数：`1,048,576 × 4 B = 4,194,304 B = 4 MiB`
+#
+# 每层有 K、V 两份 → 8 MiB；2 层 → **16 MiB**。这就是
+# `2 × L × H × D × S × B × dtype_bytes` 的来源。
+
+# %% [markdown]
+# **对账 A（配置 → 字节）**：把配置代进公式，算出一个预测值，再和 PyTorch 实际分配的
+# `t.nbytes` 之和比。相等，说明公式没有漏掉 K/V、层数、dtype 中的任何一项。
+#
+# **对账 B（字节 → 配置）**：反过来，只用总字节数和 L/H/D/B/dtype，解出
+# `S = 字节数 ÷ (2·L·H·D·B·dtype_bytes)`。解出来必须等于构造缓存时传入的 `seq_len`（4096）。
+#
+# 为什么要两个方向都做？因为两种用法在工程里都会出现：
+#
+# - 上线前做**容量规划**：已知模型和上下文，用公式算要多少显存（方向 A）；
+# - 线上做**故障诊断**：看到显存涨了，反推"现在缓存了多少 token"（方向 B）。
+#
+# 如果公式错一项，两个方向会同时暴露：忘了乘 2（K+V）→ 只剩 8 MiB；
+# 忘了乘 dtype（fp32=4 字节）→ 差 4 倍；GQA 把 H 当成 32 而不是 8 → 高估 4 倍。
 
 # %% [markdown]
 # ### 为什么先定义接口
@@ -357,13 +376,20 @@ df_phase
 # 完全受带宽约束。这也解释了为什么 batch 越大 decode 越划算（同一份权重服务更多请求），
 # 05 章的连续批处理就是围绕这一点做文章。
 #
-# 再看显存。公式 `2×L×H×D×S×B×dtype_bytes` 与 `tensor.nbytes` 必须严格相等；
-# 反过来，从实测字节数解出 S，也必须等于配置值。
+# 下面做对账 A 和 B：先打印一个具体张量的形状/字节数，再对 6 组配置批量核对。
 
 # %%
 def measured_bytes(cache):
     return sum(t.nbytes for t in cache.k + cache.v)
 
+
+demo = KVCache(cfg, batch_size=1, max_seq_len=4096, device="cpu", dtype=torch.float32)
+k0 = demo.k[0]
+print("K 张量:", tuple(k0.shape), "| 元素数:", f"{k0.numel():,}", "| 字节数:", f"{k0.nbytes:,}")
+print("对账 A：公式 =", f"{kv_cache_bytes(cfg.n_layer, cfg.n_head, cfg.head_dim, 4096, 1, 4):,}",
+      "| 实际 =", f"{measured_bytes(demo):,}")
+per_token_bytes = 2 * cfg.n_layer * cfg.n_head * cfg.head_dim * 1 * 4
+print("对账 B：反解 S =", measured_bytes(demo) // per_token_bytes, "（配置值 4096）")
 
 rows = []
 for dtype, name in [(torch.float32, "float32"), (torch.bfloat16, "bfloat16")]:
