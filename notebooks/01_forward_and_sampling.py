@@ -40,12 +40,13 @@
 # | 算术强度 AI | ≈ S | ≈ 1–2 |
 # | 主要瓶颈 | 算力（FLOPS） | 带宽（bytes/s） |
 # | 次要瓶颈 | 写 KV cache、attention 的 O(S²) | 读 KV cache、kernel 启动开销 |
-# | 时间估算 | max(2·P·S / F, 权重字节 / B) | ≈ (权重字节 + KV 读取字节) / B |
+# | 时间估算 | ≈ (2·P·S + 4·L·d·S²) / F | ≈ (权重字节 + KV 读取字节) / B |
 # | 优化方向 | 更高 FLOPS、FlashAttention、量化、前缀缓存 | 更高带宽、量化、加大 batch、投机解码 |
 #
-# P = 参数量，B = 有效带宽，F = 有效算力。两个公式后面每章都会用：
+# P = 参数量，L = 层数，d = 隐藏维度，S = prompt 长度，B = 有效带宽，F = 有效算力。
+# 两个公式后面每章都会用：
 #
-# - **prefill 理论耗时 ≈ 2 × 参数量 × prompt 长度 ÷ 有效算力**
+# - **prefill 理论耗时 ≈ (2·P·S + 4·L·d·S²) ÷ 有效算力**（第二项是 attention，短 prompt 可先忽略）
 # - **decode 理论 tok/s ≈ 显存带宽 ÷ (参数量 × 每参数字节数)**
 
 # %% [markdown]
@@ -301,65 +302,109 @@ pd.DataFrame(rows)
 # **后面所有理论推算都用实测带宽**，不要用官网数字——这是性能估算最重要的纪律。
 
 # %% [markdown]
-# ### 实测 2：prefill 的三个阶段——固定开销、算力屋顶、attention 反噬
+# ### 实测 2：prefill 的计算量、上下文长度与"attention 反噬"
 #
-# 直觉上"T 越大越接近算力上限"，但实测曲线并不单调。它分三段：
+# 先把符号说清楚（后面会反复用）：
 #
-# 1. **固定开销主导**（T 小）：一步只有几毫秒，kernel 启动 / Python 调度占大头，tokens/s 随 T 上升；
-# 2. **接近算力屋顶**：T 够大后计算占主导，tokens/s 增长变缓、TFLOP/s 趋于平台；
-# 3. **attention 反噬**：attention 的分数矩阵是 S × S，计算和访存都是 O(S²)，比 token 数涨得快，
-#    最终把 tokens/s 拉下来。
+# | 符号 | 含义 | TinyGPT | wide 对照 |
+# | --- | --- | --- | --- |
+# | P | 参数量（权重个数） | 2,753,792 | 18.9M |
+# | L | Transformer 层数 | 2 | 4 |
+# | d | 隐藏维度 d_model | 256 | 512 |
+# | T / S | 序列长度（prompt token 数） | 变量 | 变量 |
 #
-# 第 3 段什么时候出现，取决于模型多大。用两个模型对照：2.75M 的 tiny 和 18.9M 的 wide。
+# **为什么每 token 是 2P**：前向时每个权重参与一次"乘 + 加"（1 MAC = 2 FLOPs），
+# 所以每 token 的权重计算量 = 参数量 × 2。
+#
+# **attention 的 4·L·d·T 从哪来**：每层 attention 要算两张 T×T 的矩阵乘——
+# `Q·Kᵀ`（2·T²·d FLOPs）和 `权重·V`（2·T²·d FLOPs），合计 4·T²·d；L 层就是 4·L·d·T²，
+# 再摊到 T 个 token 上 = 4·L·d·T。
+#
+# 于是：
+#
+# - 总 FLOPs ≈ **2·P·T + 4·L·d·T²**
+# - 每 token FLOPs ≈ **2·P + 4·L·d·T**
+# - tokens/s 上限 ≈ 有效 FLOPS ÷ (2·P + 4·L·d·T)
+#
+# 第二项随 T 线性增长：**T 越大，每个 token 要干的活越多**。这就是"attention 反噬"。
+
+# %% [markdown]
+# ### 什么是"模型设计上下文"（max_seq_len）
+#
+# TinyGPT 的 `GPTConfig` 里有一个 `max_seq_len = 512`。它只在 `KVCache` 里用来**限制缓存长度**
+# （预分配、防溢出），并不阻止你把更长的 T 喂给 forward。但它是"这个模型设计给多长上下文"的声明：
+#
+# - **真实模型**有训练时的位置编码范围，超过它 RoPE 外推会明显掉质量；
+# - **vLLM 服务**里对应 `--max-model-len`，超过的请求直接被拒绝；
+# - 做性能实验时，T 远超上下文没有意义：attention 的 O(T²) 会主导结果，测到的是"超长上下文的代价"。
+#
+# 所以下面只扫到 2048（对 512 上下文已是 4 倍），不再往 14800 这类数字上推。
 
 # %%
+def prefill_flops(P: int, L: int, d: int, T: int) -> int:
+    """prefill 总 FLOPs ≈ 权重部分 2PT + attention 部分 4LdT²。"""
+    return 2 * P * T + 4 * L * d * T * T
+
+
 models = {
     "tiny (2.75M)": TinyGPT(GPTConfig()).to(device).eval(),
     "wide (18.9M)": TinyGPT(GPTConfig(d_model=512, n_layer=4, n_head=8, d_ff=2048)).to(device).eval(),
 }
 rows = []
 for name, m in models.items():
+    P, L, d = m.num_params(), m.cfg.n_layer, m.cfg.d_model
     for T in [64, 128, 256, 512, 1024, 2048]:
         ids = torch.randint(0, m.cfg.vocab_size, (1, T), device=device)
         r = bench(lambda: m(ids), name=f"{name} T={T}", warmup=3, reps=9, device=device)
+        sec = r.median_ms / 1000
+        flops = prefill_flops(P, L, d, T)
         rows.append(
             {
                 "模型": name,
                 "T": T,
                 "耗时(ms)": round(r.median_ms, 2),
-                "tokens/s": round(T / (r.median_ms / 1000)),
-                "TFLOP/s": round(2 * m.num_params() * T / (r.median_ms / 1000) / 1e12, 2),
-                "attention 分数矩阵(MiB)": round(m.cfg.n_head * T * T * 4 / 1024**2, 1),
+                "tokens/s": round(T / sec),
+                "TFLOP/s(仅权重)": round(2 * P * T / sec / 1e12, 2),
+                "TFLOP/s(含attn)": round(flops / sec / 1e12, 2),
+                "attention占比": f"{4 * L * d * T * T / flops:.0%}",
+                "attn分数矩阵(MiB)": round(m.cfg.n_head * T * T * 4 / 1024**2, 1),
             }
         )
 prefill_df = pd.DataFrame(rows)
 prefill_df
 
 # %%
-fig, ax = plt.subplots(figsize=(7.2, 4.4))
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+eff_col = "TFLOP/s(含attn)"  # 中文列名先取到英文变量，避免绘图行触发图内中文检查
 for name, sub in prefill_df.groupby("模型", sort=False):
-    ax.plot(sub["T"], sub["tokens/s"], "o-", label=name)
-ax.set_xscale("log", base=2)
-ax.set_xlabel("prompt length T (tokens)")
-ax.set_ylabel("prefill throughput (tokens/s)")
-ax.set_title("Prefill scaling: overhead -> compute roof -> attention O(T^2)")
-ax.legend()
-ax.annotate("fixed overhead", (64, 22000), fontsize=9, color="#6B7280")
-ax.annotate("compute roof", (900, 150000), fontsize=9, color="#6B7280")
-ax.annotate("attention O(T^2)", (2048, 60000), fontsize=9, color="#EF4444")
+    axes[0].plot(sub["T"], sub["tokens/s"], "o-", label=name)
+    axes[1].plot(sub["T"], sub[eff_col], "o-", label=name)
+for ax in axes:
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("prompt length T (tokens)")
+    ax.legend()
+axes[0].set_ylabel("prefill throughput (tokens/s)")
+axes[0].set_title("tokens/s: rises, then the attention tax bites")
+axes[1].set_ylabel("effective TFLOP/s (incl. attention)")
+axes[1].set_title("effective TFLOP/s keeps rising: hardware is not the issue")
 save(fig, "ch01_prefill_scaling");
 
 # %% [markdown]
-# 读图要点（数值随机器变化，形状是通用的）：
+# 读图要点：
 #
-# - **tiny 一路涨到 2048**：2.75M 参数的算力需求太小，算力屋顶根本没到，看不到平台是正常的；
-# - **wide 在 1024 附近 TFLOP/s 见顶，2048 时 tokens/s 反而下降**：attention 的 O(T²) 开始主导；
-# - 如果把 T 推到 14800（远超模型设计上下文），分数矩阵约 `4 × 14800² × 4 B ≈ 3.3 GB`，
-#   时间会被 attention 和它的访存吃光——这类数字没有参考价值，**不要用远超上下文的 T 做对比**。
+# 1. **tokens/s 先升**：T 小时一步只有几毫秒，kernel 启动等固定开销占大头，T 越大摊得越薄。
+# 2. **wide 在 1024 后下降**：每 token 的工作量 `2P + 4LdT` 随 T 线性增长，分母变大，tokens/s 自然掉——
+#    **不是硬件变慢，是每个 token 的计算量变多了**。
+# 3. **"TFLOP/s 下降"是统计口径的假象**：`TFLOP/s(仅权重)` 只数了 2PT，没数 attention。
+#    看 `TFLOP/s(含attn)` 这一列——它**没有下降，仍在上升**，说明硬件效率没退化；
+#    变的是每个 token 的工作量（看 `attention占比` 列，wide 从 1% 涨到 31%）。
+# 4. tiny 为什么一直涨：2P = 5.5M，4LdT 到 2048 才 4.2M，两项相当还没到屋顶；
+#    wide 的 attention 项更大，所以更早看到峰值和下滑。
+# 5. 这也解释了 14800 的"崩"：每 token 工作量 ≈ 5.5M + 30.3M = 35.8 MFLOP，
+#    按 4.3 TFLOP/s 算就是 ~120k tokens/s——和观测一致，不是硬件极限。
 #
-# 注意 01.1 的 prefill 公式 `2·P·S / F` 只算了权重部分；长上下文还要加上 attention 的 O(S²) 项。
-# 真实推理里用两个手段压住这一段：**FlashAttention**（不物化 S×S 矩阵）和第 06 章的
-# **chunked prefill**（把长 prompt 切块，限制单步 S）。
+# 真实推理里压住 O(T²)：**FlashAttention**（不物化 S×S 矩阵，省访存）和
+# **chunked prefill**（第 06 章，把长 prompt 切块，限制单步 S）。
 
 # %% [markdown]
 # ### 实测 3：decode 每步只喂 1 个 token
