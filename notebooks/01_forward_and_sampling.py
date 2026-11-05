@@ -301,26 +301,65 @@ pd.DataFrame(rows)
 # **后面所有理论推算都用实测带宽**，不要用官网数字——这是性能估算最重要的纪律。
 
 # %% [markdown]
-# ### 实测 2：prefill 随 prompt 变长，吞吐先升后平
+# ### 实测 2：prefill 的三个阶段——固定开销、算力屋顶、attention 反噬
 #
-# prefill 一次处理 T 个 token，浮点运算量 ≈ 2 × 参数量 × T，读取的权重是固定的。
-# 所以 T 越大，算术强度越高，越接近算力上限。
+# 直觉上"T 越大越接近算力上限"，但实测曲线并不单调。它分三段：
+#
+# 1. **固定开销主导**（T 小）：一步只有几毫秒，kernel 启动 / Python 调度占大头，tokens/s 随 T 上升；
+# 2. **接近算力屋顶**：T 够大后计算占主导，tokens/s 增长变缓、TFLOP/s 趋于平台；
+# 3. **attention 反噬**：attention 的分数矩阵是 S × S，计算和访存都是 O(S²)，比 token 数涨得快，
+#    最终把 tokens/s 拉下来。
+#
+# 第 3 段什么时候出现，取决于模型多大。用两个模型对照：2.75M 的 tiny 和 18.9M 的 wide。
 
 # %%
+models = {
+    "tiny (2.75M)": TinyGPT(GPTConfig()).to(device).eval(),
+    "wide (18.9M)": TinyGPT(GPTConfig(d_model=512, n_layer=4, n_head=8, d_ff=2048)).to(device).eval(),
+}
 rows = []
-for T in [64, 128, 256, 512]:
-    ids = torch.randint(0, cfg.vocab_size, (1, T), device=device)
-    r = bench(lambda: model(ids), name=f"prefill T={T}", warmup=2, reps=5, device=device)
-    rows.append(
-        {
-            "prompt 长度": T,
-            "耗时(ms)": round(r.median_ms, 2),
-            "tokens/s": round(T / (r.median_ms / 1000), 1),
-            "TFLOP/s": round(2 * model.num_params() * T / (r.median_ms / 1000) / 1e12, 3),
-        }
-    )
+for name, m in models.items():
+    for T in [64, 128, 256, 512, 1024, 2048]:
+        ids = torch.randint(0, m.cfg.vocab_size, (1, T), device=device)
+        r = bench(lambda: m(ids), name=f"{name} T={T}", warmup=3, reps=9, device=device)
+        rows.append(
+            {
+                "模型": name,
+                "T": T,
+                "耗时(ms)": round(r.median_ms, 2),
+                "tokens/s": round(T / (r.median_ms / 1000)),
+                "TFLOP/s": round(2 * m.num_params() * T / (r.median_ms / 1000) / 1e12, 2),
+                "attention 分数矩阵(MiB)": round(m.cfg.n_head * T * T * 4 / 1024**2, 1),
+            }
+        )
 prefill_df = pd.DataFrame(rows)
 prefill_df
+
+# %%
+fig, ax = plt.subplots(figsize=(7.2, 4.4))
+for name, sub in prefill_df.groupby("模型", sort=False):
+    ax.plot(sub["T"], sub["tokens/s"], "o-", label=name)
+ax.set_xscale("log", base=2)
+ax.set_xlabel("prompt length T (tokens)")
+ax.set_ylabel("prefill throughput (tokens/s)")
+ax.set_title("Prefill scaling: overhead -> compute roof -> attention O(T^2)")
+ax.legend()
+ax.annotate("fixed overhead", (64, 22000), fontsize=9, color="#6B7280")
+ax.annotate("compute roof", (900, 150000), fontsize=9, color="#6B7280")
+ax.annotate("attention O(T^2)", (2048, 60000), fontsize=9, color="#EF4444")
+save(fig, "ch01_prefill_scaling");
+
+# %% [markdown]
+# 读图要点（数值随机器变化，形状是通用的）：
+#
+# - **tiny 一路涨到 2048**：2.75M 参数的算力需求太小，算力屋顶根本没到，看不到平台是正常的；
+# - **wide 在 1024 附近 TFLOP/s 见顶，2048 时 tokens/s 反而下降**：attention 的 O(T²) 开始主导；
+# - 如果把 T 推到 14800（远超模型设计上下文），分数矩阵约 `4 × 14800² × 4 B ≈ 3.3 GB`，
+#   时间会被 attention 和它的访存吃光——这类数字没有参考价值，**不要用远超上下文的 T 做对比**。
+#
+# 注意 01.1 的 prefill 公式 `2·P·S / F` 只算了权重部分；长上下文还要加上 attention 的 O(S²) 项。
+# 真实推理里用两个手段压住这一段：**FlashAttention**（不物化 S×S 矩阵）和第 06 章的
+# **chunked prefill**（把长 prompt 切块，限制单步 S）。
 
 # %% [markdown]
 # ### 实测 3：decode 每步只喂 1 个 token

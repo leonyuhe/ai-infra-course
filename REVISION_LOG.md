@@ -19,6 +19,7 @@
 | 2026-11-05 | `REVISION_LOG.md` | 建立修订日志（本文件） | 本地 |
 | 2026-11-05 | `tools/build_site.py`、`.github/workflows/pages.yml` | 新增 `--ci-banner` 开关：本地预览不显示 CI 提示，线上构建才显示 | 本地 |
 | 2026-11-05 | `notebooks/01_forward_and_sampling.py`、`assets/figures/ch01_pipeline.svg` | 01.2 重写：全貌流水线图、参数账本（2,753,792 × 4 = 11,015,168 B ≈ 10.5 MiB）、前向形状追踪、attention/SDPA 讲解、采样整体逻辑、与带宽/算力的关系 | 本地 |
+| 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 实测 2 重写：prefill 三阶段（固定开销/算力屋顶/attention 反噬），tiny vs wide 双模型对照，加入 attention 分数矩阵大小列；说明 14800 这类超长 T 无参考价值 | 本地 |
 |  |  |  |  |
 
 ## 一次性发布 checklist（全部修订完成后）
