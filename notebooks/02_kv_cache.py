@@ -1,133 +1,100 @@
 # %% [markdown]
 # # 第 02 章 · KV Cache：把 O(T²) 重复计算变成 O(T)
 #
-# > 同一个模型、同一段 prompt，为什么别人写得比你快一个数量级？先看它少算了什么。
+# > 同一段 prompt，为什么有人生成快一个数量级？差别在于每一步少算了什么。
 #
 # | 项目 | 内容 |
 # | --- | --- |
-# | 预计用时 | 60–75 分钟 |
+# | 预计用时 | 90 分钟 |
 # | 运行环境 | 🏠 Mac（MPS / CPU）· 无需 GPU · torch 2.15 |
-# | 前置章节 | 01（`aiinfra.tinygpt` 的 TinyGPT 前向与采样） |
-# | 本章产物 | 手写 `KVCache`、prefill/decode 两阶段实测、KV 显存公式与 Qwen3-8B 级显存表 |
+# | 前置章节 | 01（TinyGPT 前向、采样、prefill/decode 两阶段） |
+# | 本章产物 | 手写 `KVCache`、缓存版 attention、缓存生成循环、三组实测、KV 显存公式 |
 # | 本章接口 | `KVCache.append / get / advance / seq_len`（03、04 章直接复用） |
 #
 # **学完你能回答：**
-# 1. 为什么 LLM 推理必须分 prefill 和 decode 两个阶段？它们的瓶颈为什么不同？
-# 2. KV cache 占多少显存？给定模型配置和上下文长度，能否心算出答案？
-# 3. 不用 KV cache 时，生成长度翻倍，时间为什么变成 4 倍？用了之后为什么是 2 倍？
+# 1. 为什么生成必须分 prefill 和 decode 两段？它们的瓶颈为什么不同？
+# 2. 缓存版 attention 怎么写才对？怎么证明它和全量前向等价？
+# 3. KV cache 占多少显存？给定模型和上下文能否心算？
+# 4. 不用缓存时总时间为什么是 O(T²)，用了为什么是 O(T)？
 
 # %% [markdown]
-# ## 02.1 问题与直觉
+# ## 02.0 本章目标与路线
 #
-# 一句话：**生成第 t 个 token 时，前 t−1 个 token 的 K/V 只由它们自己决定**（因果注意力不看未来），
-# 所以每一步都重算历史 K/V 是纯浪费。
+# **一句话目标**：把自回归生成从「每步重算整段 prompt」改成「prefill 一次、decode 复用 K/V」，
+# 在不改变输出结果的前提下，把每步计算量从 O(S+t) 降到 O(1)，把总时间从二次降到一次。
 #
-# 先看时间轴：同一个 512-token prompt，连续生成 4 个 token，两种做法分别算了多少 token：
+# **代价**：显存。KV cache 随上下文线性增长，长上下文时它比权重还大；这决定了后面的分页（03 章）。
+#
+# **本章交付四样东西**：
+#
+# | # | 交付物 | 在哪一节 | 怎么验收 |
+# | --- | --- | --- | --- |
+# | 1 | `KVCache` 数据结构（连续预分配） | 02.3 Step 1 | 显存公式 == 实际分配字节数 |
+# | 2 | 缓存版 attention + 模型前向 | 02.3 Step 2–3 | 与全量前向 logits 一致（atol 1e-3） |
+# | 3 | 缓存生成循环（naive vs cached） | 02.3 Step 4–5 | 贪心 token 逐个相等 |
+# | 4 | 三组实验：两阶段吞吐、显存账本、总时间 | 02.4 实验 A/B/C | 趋势与公式吻合 |
+#
+# **阅读路线**：02.1 问题 → 02.2 高阶设计 → 02.3 分步实现（5 步，每步有验收）→ 02.4 实验 → 02.5 对照 vLLM。
+
+# %% [markdown]
+# ## 02.1 问题与直觉：naive 生成为什么慢
+#
+# 因果注意力有一个性质：**生成第 t 个 token 时，前 t−1 个 token 的 K/V 只由它们自己决定**，
+# 不会因为后面生成了什么而改变。
+#
+# 但最直的实现（naive）每步都把「prompt + 已生成」整段重新喂进模型：
 #
 # ![](../assets/figures/ch02_prefill_decode.svg)
 #
-# **反例（naive 生成）**：把「prompt + 已生成」整段喂进模型，每步都重算所有 token 的 K/V。
-# 生成 T 个 token 要做 T 次前向，第 t 次前向的长度是 S+t，总计算量 ≈ O(T·(S+T)) → 二次。
+# - 生成 T 个 token 要做 T 次前向；
+# - 第 t 次前向的长度是 S+t，attention 计算量随长度平方增长；
+# - 总计算量 ≈ O(T·(S+T))，**二次**。其中绝大部分是在重算已经算过的 K/V。
 #
-# **正解（KV cache）**：第一次前向把 prompt 的 K/V 算好存起来（prefill），
-# 之后每步只喂 1 个新 token（decode），复用缓存里的 K/V，不再重算历史。
+# KV cache 的做法：第一次前向（prefill）把 prompt 的 K/V 存下来，之后每步（decode）
+# 只喂 1 个新 token，复用缓存——每步从 O(S+t) 降到 O(1)，总时间变成 O(S+T)。
+#
+# 两个必须分清的概念：
+#
+# | | prefill | decode |
+# | --- | --- | --- |
+# | 输入 | `(B, S)` 整段 prompt | `(B, 1)` 新 token |
+# | 做什么 | 并行算所有位置、所有层的 K/V，写入缓存 | 读缓存 K/V，算 1 个 token，追加缓存 |
+# | 瓶颈 | 算力（S 个位置并行） | 带宽（每步读全部权重 + 整个缓存） |
+#
+# 02.4 实验 A 会量出两者差两个数量级。先不要记数字，先记住**它们为什么不同**。
 
 # %% [markdown]
-# ### prefill 和 decode 到底在做什么
+# ## 02.2 高阶设计
 #
-# 把一次生成拆成两段，它们的输入形状完全不同：
+# 动手前先把方案定下来。整章只有三个组件和一条数据流。
 #
-# **prefill（预填充）**：输入 `(B, S)` 的整段 prompt，一次前向算出所有位置、所有层的 K/V，
-# 写进 KV cache；只取最后一个位置的 logits 去采样第一个回复 token。
-# 因为 S 个位置可以并行计算，GPU 的算力能被喂满——**算力受限**。
+# **组件 1：KVCache（存什么）**
+# 模型有 L 层，每层产生 K/V。对每条序列、每一层缓存两份张量，形状 `(B, H_kv, S, D)`；
+# S 是已处理的 token 数，每多一个 token 就往 S 维追加一列。
+# 本章选**连续预分配**：启动时按 `max_seq_len` 开好整块显存。优点是 attention 取 K/V 零拷贝；
+# 缺点是短请求按最大长度占坑，浪费显存（第 03 章用分页解决）。
 #
-# **decode（解码）**：输入 `(B, 1)` 的新 token，用缓存里的 `[0, S)` K/V 做 attention，
-# 算出这个位置的 K/V 并追加到缓存，再取 logits 采样下一个 token。
-# 每一步只算 1 个 token，但要把**全部权重 + 整个 KV cache** 读一遍——**带宽受限**。
+# **组件 2：缓存版 attention（怎么用）**
+# 与普通 attention 的差别只有三处：
+# 1. 新 token 的 K/V 先 `append` 进 cache；
+# 2. 取回 `[0, prefix+T)` 的 K/V（历史 + 刚写入的）；
+# 3. mask 规则：**历史前缀全可见，当前块内因果**。
 #
-# 换句话说：**prefill 是"一次算很多"，decode 是"一次算一个、但每次都要搬一遍家底"。**
-
-# %% [markdown]
-# 两阶段的差异可以量出来。下表是本章 02.3 的实测（TinyGPT 2.8M，batch=8，M3 Ultra MPS，
-# warmup=2、reps=5 取中位数，上下文 256–2048）：
+# **组件 3：生成循环（谁在调度）**
+# - prefill：整段 prompt 一次前向，所有层写入 cache，然后 `advance(S)`；
+# - decode：每步喂 1 个 token，所有层 append，再 `advance(1)`。
 #
-# | 阶段 | 一次前向的输入 | 瓶颈 | 本章实测（每序列） |
-# | --- | --- | --- | --- |
-# | prefill | `(B, S)`，S 个 prompt token 并行 | 算力 / kernel 并行度 | 约 6.6–9.9 万 tok/s |
-# | decode | `(B, 1)`，每步 1 个新 token | 带宽 / kernel 启动开销 | 约 455–750 tok/s |
-#
-# 读数口径很重要，否则会误比：
-#
-# - prefill 吞吐 = `S ÷ prefill 耗时`（每个序列每秒能 prefill 多少 token）；
-# - decode 吞吐 = `1 ÷ 单步耗时`（每个序列每秒能生成多少 token）；
-# - batch=8 表示一次前向同时服务 8 条序列；表里是**每序列**数字，聚合吞吐要 ×8。
-#
-# 差两个数量级的原因不是 decode 算得多，而是它**读得多、算得少**：每生成 1 个 token，
-# 都要把全部权重和整个 KV cache 读一遍，算术强度 ≈ 1 FLOP/byte，完全受带宽约束。
-# 这也是 batch 越大 decode 越划算的原因（同一份权重服务更多请求），第 05 章的连续批处理就围绕这一点。
-
-# %% [markdown]
-# ### KV cache 占多少显存
-#
-# 显存布局很朴素：每一层存两份张量 K / V，形状 `(B, H_kv, S, D)`；序列增长就是往 S 维追加：
-#
-# ![](../assets/figures/ch02_memory_layout.svg)
-#
-# 把图换算成公式（全是乘法）：
+# 数据流：
 #
 # ```text
-# KV 字节 = 2 × L × H × D × S × B × dtype_bytes
-# ```
-#
-# - `2`：K 和 V 两份张量；
-# - `L`：层数；
-# - `H`：**KV 头数**（GQA 下小于注意力头数，这是最容易算错的地方）；
-# - `D`：每个头的维度 `head_dim`；
-# - `S`：序列长度；`B`：batch；`dtype_bytes`：每个元素几字节（fp16=2，fp32=4）。
-#
-# 用本章的 TinyGPT 代进去（L=2, H=4, D=64, S=4096, B=1, fp32）：
-#
-# ```text
-# 2 × 2 × 4 × 64 × 4096 × 1 × 4 = 16,777,216 字节 = 16 MiB
+# token id → embedding → [ 每层: attention(读 cache) + MLP ] → logits → sample → 下一个 token
 # ```
 
 # %% [markdown]
-# ### 用两个方向对账
+# ### 接口契约
 #
-# 公式写出来容易，但很容易漏项。所以用一个**能精确测量**的小缓存来对账：
-# 先用具体张量把公式推一遍，再从两个方向各核对一次。
-#
-# 先看**一个** K 张量（TinyGPT，B=1, S=4096, fp32）：
-#
-# - 形状：`(B, H, S, D) = (1, 4, 4096, 64)`
-# - 元素数：`1 × 4 × 4096 × 64 = 1,048,576`
-# - 字节数：`1,048,576 × 4 B = 4,194,304 B = 4 MiB`
-#
-# 每层有 K、V 两份 → 8 MiB；2 层 → **16 MiB**。这就是
-# `2 × L × H × D × S × B × dtype_bytes` 的来源。
-
-# %% [markdown]
-# **对账 A（配置 → 字节）**：把配置代进公式，算出一个预测值，再和 PyTorch 实际分配的
-# `t.nbytes` 之和比。相等，说明公式没有漏掉 K/V、层数、dtype 中的任何一项。
-#
-# **对账 B（字节 → 配置）**：反过来，只用总字节数和 L/H/D/B/dtype，解出
-# `S = 字节数 ÷ (2·L·H·D·B·dtype_bytes)`。解出来必须等于构造缓存时传入的 `seq_len`（4096）。
-#
-# 为什么要两个方向都做？因为两种用法在工程里都会出现：
-#
-# - 上线前做**容量规划**：已知模型和上下文，用公式算要多少显存（方向 A）；
-# - 线上做**故障诊断**：看到显存涨了，反推"现在缓存了多少 token"（方向 B）。
-#
-# 如果公式错一项，两个方向会同时暴露：忘了乘 2（K+V）→ 只剩 8 MiB；
-# 忘了乘 dtype（fp32=4 字节）→ 差 4 倍；GQA 把 H 当成 32 而不是 8 → 高估 4 倍。
-
-# %% [markdown]
-# ### 为什么先定义接口
-#
-# 本章要写一个**连续预分配**的 KV cache；第 03 章会换成**分页**实现，第 04 章再加**前缀共享**。
-# 三种实现的内部结构完全不同，但上层 attention 的调用方式应该不变——否则每章都要重写 attention。
-#
-# 所以先约定 4 个方法（03/04 章原样复用）：
+# 02.3 的实现、第 03 章的分页、第 04 章的前缀共享，内部结构完全不同，
+# 但上层 attention 的调用方式应该不变。所以先约定 4 个方法：
 #
 # | 方法 | 语义 |
 # | --- | --- |
@@ -136,7 +103,7 @@
 # | `advance(n)` | 推进逻辑长度 |
 # | `seq_len` | 当前已缓存的 token 数 |
 #
-# 为什么 `append` 和 `advance` 要分开？看一次 decode step 的执行顺序：
+# 为什么 `append` 和 `advance` 要分开？看一次 decode step：
 #
 # ```text
 # 当前 seq_len = n
@@ -147,22 +114,35 @@
 # advance(1)                -> seq_len: n -> n+1
 # ```
 #
-# 所有层必须写到**同一个位置 n**，所以长度不能在某一层写完后立刻推进；
-# 要等 L 层都写完，再统一 `advance`。prefill 时同理：每层一次 `append` 写入 T 个 token，
-# 全部层写完后 `advance(T)`。
-#
-# `seq_len` 同时被两处使用：RoPE 的 `start_pos`（新 token 的位置）和 causal mask 的边界。
+# 所有层必须写到同一个位置 n，所以长度不能在某一层写完后立刻推进；要等 L 层都写完再 `advance`。
+# prefill 同理：每层 `append` 写入 T 个 token，全部层写完后 `advance(T)`。
+# `seq_len` 同时给 RoPE 的 `start_pos` 和 causal mask 的边界使用。
 
 # %% [markdown]
-# ## 02.2 从零实现
+# ### 验收标准
 #
-# 先写最朴素、最教科书的版本：**每个请求按 max_seq_len 一次性预分配，(B, H, S, D) 连续布局**。
-# 这个版本简单、attention 零拷贝，但会浪费大量显存（03 章的开场问题就来自这里）。
+# 每个实现步骤都配一条可执行的验收，写不出来就说明没理解：
 #
-# 注意：本章的 `attention_with_cache` 是**手写**的，没有直接调用 `TinyGPT.forward(..., kv_cache=)`。
-# 两个原因：一是本章要把「前缀全部可见 + 当前块内三角掩码」这个语义**显式**写出来（缓存版
-# attention 最容易错的就是 mask），二是章节要求自包含，03/04 章会原样复用这段实现。
-# 写对与否由 02.2 末尾的断言验证。
+# | 步骤 | 验收 |
+# | --- | --- |
+# | Step 1 数据结构 | 公式字节数 == `tensor.nbytes` 之和；反解 S == 配置值 |
+# | Step 2 缓存 attention | 与全量前向的 logits 最大误差 < 1e-3 |
+# | Step 3 接入模型 | 同上（整模型输出一致） |
+# | Step 4 生成循环 | 贪心生成的 token 逐个相等 |
+# | Step 5 实验 | 两阶段吞吐、显存、总时间三条曲线与公式趋势一致 |
+
+# %% [markdown]
+# ## 02.3 从零实现：分五步
+#
+# 分成 5 步，每步先讲目标和做法，再给代码，最后给验收：
+#
+# | Step | 做什么 | 代码 |
+# | --- | --- | --- |
+# | 1 | 定义 `KVCache`：怎么存、怎么追加、怎么取 | `KVCache` 类 |
+# | 2 | 写缓存版 attention：mask 与位置怎么处理 | `attention_with_cache` |
+# | 3 | 把 cache 接进整个模型的前向 | `forward_with_cache` |
+# | 4 | 写两条生成路径：naive 与 cached | `generate_naive` / `generate_cached` |
+# | 5 | 用断言证明两条路径结果相同 | logits / token 对比 |
 
 # %%
 import math
@@ -191,10 +171,11 @@ model = TinyGPT(cfg).to(device).eval()
 print(f"device = {device} | params = {model.num_params() / 1e6:.2f}M")
 
 # %% [markdown]
-# ### 数据结构：KVCache
+# ### Step 1 · 存储布局：KVCache
 #
-# 预分配 `(B, H, max_seq_len, D)`，`append` 是纯切片赋值（零额外显存），`get` 返回**视图**而不是
-# 拷贝——这是连续布局的最大优点，也是下一章分页布局要付的代价。
+# 目标：把「每层 K/V、形状 `(B,H,S,D)`、按 token 追加」封装成 4 个方法。
+# 本章用连续预分配：`__init__` 按 `max_seq_len` 一次开好全部显存；`append` 是切片赋值
+# （不额外分配），`get` 返回**视图**（零拷贝）。
 
 # %%
 class KVCache:
@@ -230,19 +211,19 @@ class KVCache:
         return self._len
 
 # %% [markdown]
-# ### 把 cache 接进 attention：只改 4 行
+# ### Step 2 · 缓存版 attention
 #
-# 缓存版 attention 与不缓存版的差异只有三处：写入新 K/V、取回「前缀 + 当前块」、以及 mask。
-# mask 的正确语义是：**前缀位置全部可见，当前块内按三角掩码**。写成公式：
+# 目标：在普通 attention 上只改三处——写入新 K/V、取回前缀+当前块、修正 mask。
+# mask 的正确语义：
 #
 # ```text
-# mask[i, j] = 0            if j < prefix      （历史 token 全可见）
-#            = 0            if prefix <= j <= prefix + i（块内因果）
-#            = -inf         if j > prefix + i
+# mask[i, j] = 0      if j < prefix                 历史全可见
+#            = 0      if prefix <= j <= prefix + i  块内因果
+#            = -inf   if j > prefix + i
 # ```
 #
-# 这里故意把 mask 写成显式二维张量，是为了让读者看清语义；真实 kernel 里用
-# `causal=True` + 分块偏移，不会真的构造 (T, S) 的 mask。
+# 这里故意显式构造二维 mask 让语义可见；真实 kernel 用 `causal=True` + 分块偏移，
+# 不会真的建 (T,S) 矩阵。
 
 # %%
 def attention_with_cache(attn, x, cache, layer, start_pos):
@@ -265,7 +246,13 @@ def attention_with_cache(attn, x, cache, layer, start_pos):
     att = F.softmax(((q @ k_all.transpose(-2, -1)) / math.sqrt(D) + mask).float(), dim=-1).to(q.dtype)
     return attn.proj((att @ v_all).transpose(1, 2).reshape(B, T, C))
 
+# %% [markdown]
+# ### Step 3 · 把 cache 接进模型
+#
+# 目标：embedding / MLP / norm 与 `TinyGPT.forward` 完全一致，只把每层 attention 换成缓存版。
+# 这样可以在同一套权重上对比「有缓存」和「无缓存」的输出。
 
+# %%
 def forward_with_cache(model, idx, cache, start_pos=0):
     """把 cache 注入每一层；embedding / MLP / norm 与 TinyGPT.forward 完全一致。"""
     x = model.tok_emb(idx)
@@ -275,12 +262,12 @@ def forward_with_cache(model, idx, cache, start_pos=0):
     return model.lm_head(model.norm_f(x))
 
 # %% [markdown]
-# ### 反例 vs 正解
+# ### Step 4 · 两条生成路径
 #
-# 先写两条生成路径：`generate_naive` 每步重跑全序列（反例），`generate_cached` 只 prefill 一次
-# 然后每步喂 1 个 token。两者都用贪心采样（temperature=0），所以**生成的 token 必须逐个相等**；
-# 同时我们把 cached 路径每一步产生的 logits 收集起来，与一次全序列前向的 logits 逐位置对比。
-# 这是本章最重要的一组断言：它证明缓存没有改变数学结果。
+# - `generate_naive`：每步把整段重跑（反例，用来对照）；
+# - `generate_cached`：prefill 一次，之后每步 1 个 token。
+#
+# 两者都用贪心采样（temperature=0），所以生成结果必须逐个 token 相等。
 
 # %%
 @torch.no_grad()
@@ -307,8 +294,10 @@ def generate_cached(model, prompt, max_new_tokens):
     return out, torch.cat(per_step, dim=1)
 
 # %% [markdown]
-# 跑起来，然后用断言把「等价性」钉死。`atol=1e-3` 是给浮点累加顺序差异留的余量：
-# 一次前向算 120 个位置 vs 分成 1 + 24 次前向，矩阵乘的累加顺序不同，最后一位会不同。
+# ### Step 5 · 验收：证明缓存没改变结果
+#
+# 把 cached 路径每一步的 logits 收集起来，与「一次全量前向」的 logits 逐位置比较。
+# `atol=1e-3` 是给浮点累加顺序差异留的余量（一次算 120 个位置 vs 分 1+24 次算）。
 
 # %%
 prompt = torch.randint(0, cfg.vocab_size, (2, 96), device=device)
@@ -324,15 +313,27 @@ assert naive_out.shape == (2, 120) and cached_out.shape == (2, 120)
 print(f"token 完全一致 ✓  |  logits 最大误差 = {logits_gap:.2e}（阈值 1e-3）")
 
 # %% [markdown]
-# 注意上面两条路径的**输出**一样，但**计算量**差了一个数量级——接下来用 00 章的 `bench()` 量出来。
+# 两条路径输出一致，但计算量差一个数量级。下面用 00 章的 `bench()` 量出来。
 
 # %% [markdown]
-# ## 02.3 实测
+# ## 02.4 实测
 #
-# 测量协议：M3 Ultra / 96GB / torch 2.15 / MPS，`warmup=2, reps=5` 取中位数。
-# 固定随机权重、固定 seed；**绝对值随机器变化，趋势才是本章要传递的结论**。
+# 三个实验，分别回答三个问题：
 #
-# 先量 prefill 和 decode 两阶段：batch=8，上下文从 256 到 2048。
+# | 实验 | 问题 | 产出 |
+# | --- | --- | --- |
+# | A | prefill 和 decode 差多少？为什么？ | 两阶段吞吐表 |
+# | B | KV cache 占多少显存？公式对不对？ | 对账表 + 8B 模型显存表 |
+# | C | 省下来的时间有多少？ | 每 token 延迟与累计时间曲线 |
+#
+# 测量协议：M3 Ultra / 96GB / torch 2.15 / MPS，`warmup=2, reps=5` 取中位数；
+# 固定随机权重，绝对值随机器变化，**趋势才是结论**。
+
+# %% [markdown]
+# ### 实验 A · prefill 与 decode 的吞吐差
+#
+# batch=8，上下文 256–2048。prefill 吞吐 = `S ÷ 耗时`；decode 吞吐 = `1 ÷ 单步耗时`；
+# 表里都是**每序列**数字，聚合吞吐 ×8。
 
 # %%
 B = 8
@@ -372,11 +373,64 @@ df_phase
 # %% [markdown]
 # **读表**：prefill 一次并行处理 S 个 token，吞吐 6.6–9.9 万 tok/s；decode 每步只出 1 个 token，
 # 吞吐 455–750 tok/s，**差两个数量级**。原因不是 decode 算得多，而是它「读得多、算得少」：
-# 每生成 1 个 token，至少要把全部权重和整个 KV cache 从显存读一遍，算术强度 ≈ 1 FLOP/byte，
+# 每生成 1 个 token，至少要把全部权重和整个 KV cache 读一遍，算术强度 ≈ 1 FLOP/byte，
 # 完全受带宽约束。这也解释了为什么 batch 越大 decode 越划算（同一份权重服务更多请求），
-# 05 章的连续批处理就是围绕这一点做文章。
+# 第 05 章的连续批处理就是围绕这一点做文章。
+
+# %% [markdown]
+# ### 实验 B · KV 显存账本
 #
-# 下面做对账 A 和 B：先打印一个具体张量的形状/字节数，再对 6 组配置批量核对。
+# 显存布局很朴素：每一层存两份张量 K / V，形状 `(B, H_kv, S, D)`；序列增长就是往 S 维追加：
+#
+# ![](../assets/figures/ch02_memory_layout.svg)
+#
+# 把图换算成公式（全是乘法）：
+#
+# ```text
+# KV 字节 = 2 × L × H × D × S × B × dtype_bytes
+# ```
+#
+# - `2`：K 和 V 两份张量；
+# - `L`：层数；
+# - `H`：**KV 头数**（GQA 下小于注意力头数，这是最容易算错的地方）；
+# - `D`：每个头的维度 `head_dim`；
+# - `S`：序列长度；`B`：batch；`dtype_bytes`：每个元素几字节（fp16=2，fp32=4）。
+#
+# 用本章 TinyGPT 代进去（L=2, H=4, D=64, S=4096, B=1, fp32）：
+#
+# ```text
+# 2 × 2 × 4 × 64 × 4096 × 1 × 4 = 16,777,216 字节 = 16 MiB
+# ```
+
+# %% [markdown]
+# #### 用两个方向对账
+#
+# 公式写出来容易，但很容易漏项。所以用一个**能精确测量**的小缓存来对账：
+# 先用具体张量把公式推一遍，再从两个方向各核对一次。
+#
+# 先看**一个** K 张量（TinyGPT，B=1, S=4096, fp32）：
+#
+# - 形状：`(B, H, S, D) = (1, 4, 4096, 64)`
+# - 元素数：`1 × 4 × 4096 × 64 = 1,048,576`
+# - 字节数：`1,048,576 × 4 B = 4,194,304 B = 4 MiB`
+#
+# 每层有 K、V 两份 → 8 MiB；2 层 → **16 MiB**。这就是
+# `2 × L × H × D × S × B × dtype_bytes` 的来源。
+
+# %% [markdown]
+# **对账 A（配置 → 字节）**：把配置代进公式，算出一个预测值，再和 PyTorch 实际分配的
+# `t.nbytes` 之和比。相等，说明公式没有漏掉 K/V、层数、dtype 中的任何一项。
+#
+# **对账 B（字节 → 配置）**：反过来，只用总字节数和 L/H/D/B/dtype，解出
+# `S = 字节数 ÷ (2·L·H·D·B·dtype_bytes)`。解出来必须等于构造缓存时传入的 `seq_len`（4096）。
+#
+# 为什么要两个方向都做？因为两种用法在工程里都会出现：
+#
+# - 上线前做**容量规划**：已知模型和上下文，用公式算要多少显存（方向 A）；
+# - 线上做**故障诊断**：看到显存涨了，反推"现在缓存了多少 token"（方向 B）。
+#
+# 如果公式错一项，两个方向会同时暴露：忘了乘 2（K+V）→ 只剩 8 MiB；
+# 忘了乘 dtype（fp32=4 字节）→ 差 4 倍；GQA 把 H 当成 32 而不是 8 → 高估 4 倍。
 
 # %%
 def measured_bytes(cache):
@@ -454,10 +508,13 @@ df_kv
 # 但 32K 上下文、batch=32 是 **144 GiB**——单张 80GB 卡都放不下。这就是长上下文服务
 # 「显存先于算力成为瓶颈」的原因。GQA 已经替我们省掉 4 倍；如果没有 GQA（32 个 KV 头），
 # 32K / batch=32 会是 576 GiB。
+
+# %% [markdown]
+# ### 实验 C · 生成总时间：O(T²) vs O(T)
 #
-# 有了单步延迟，就能回答「生成长度翻倍，时间为什么变 4 倍」。我们在 prompt=512 下，
-# 分别测量「已生成 t 个 token 时，下一个 token 要花多久」：naive 每步要重算整个上下文，
-# cached 每步只算 1 个 token。
+# 有了单步延迟，就能回答「生成长度翻倍，时间为什么变 4 倍」。
+# prompt=512，测「已生成 t 个 token 时，下一个 token 要花多久」：
+# naive 每步重算整个上下文，cached 每步只算 1 个 token。
 
 # %%
 P = 512
@@ -507,7 +564,7 @@ save(fig, "ch02_step_latency");
 
 # %% [markdown]
 # **读图**：naive 的每 token 延迟从 5.2ms 涨到 28.4ms（5.4 倍），cached 稳定在 1.5–1.7ms。
-# 把这两条曲线沿 x 轴累加，就得到「生成 T 个 token 的总时间」——naive 是二次，cached 是一次：
+# 把两条曲线沿 x 轴累加，就得到「生成 T 个 token 的总时间」——naive 是二次，cached 是一次：
 
 # %%
 x = df_lat["已生成 tokens"].to_numpy()
@@ -529,16 +586,16 @@ print(f"生成 1536 个 token：naive 约 {total_naive[-1] / 1000:.1f}s vs cache
 
 # %% [markdown]
 # **读图**：生成 1536 个 token，naive 累计约 24s，cached 累计约 2.5s，差约 10 倍；
-# 而且差距随生成长度继续拉大（二次 vs 一次）。
+# 差距随生成长度继续拉大（二次 vs 一次）。
 #
-# 为什么实测的 cached 不是「1 个 token 的算力」而是一个 ~1.5ms 的地板？因为 MPS 上是小模型，
+# 为什么 cached 不是「1 个 token 的算力」而是一个 ~1.5ms 的地板？因为 MPS 上是小模型，
 # 每次前向的固定开销（Python 调用 + kernel 启动 + 同步）占了大头。真实 8B 模型上这部分
 # 相对可忽略，decode 的单步时间会更接近「权重字节数 ÷ 显存带宽」。
-#
+
 # %% [markdown]
-# ## 02.4 对照工业实现（vLLM）
+# ## 02.5 对照工业实现（vLLM）
 #
-# 本课程锁定 **vLLM 0.28.x**（v1 engine 默认）。本章手写的 60 行在 vLLM 里被拆成了
+# 本课程锁定 **vLLM 0.28.x**（v1 engine 默认）。本章手写的 60 行在 vLLM 里被拆成
 # 「配置 → 显存池 → block 管理 → attention backend」四层：
 #
 # | 我们的实现 | vLLM 中的对应物 | 真实文件（0.28.x） |
@@ -553,40 +610,35 @@ print(f"生成 1536 个 token：naive 约 {total_naive[-1] / 1000:.1f}s vs cache
 #
 # | 参数 | 本章的哪条公式 | 说明 |
 # | --- | --- | --- |
-# | `--block-size`（`block_size`） | 03 章：分页粒度 | 默认 16；本章的连续预分配相当于 block_size = max_model_len |
-# | `--gpu-memory-utilization`（`gpu_memory_utilization`） | KV 显存预算 | 默认 0.9，留 10% 给激活值/临时 buffer |
-# | `--max-model-len`（`max_model_len`） | 公式里的 S | 直接决定单请求 KV 上限 |
-# | `--kv-cache-dtype`（`cache_dtype`） | 公式里的 dtype_bytes | `auto` / `fp8`；fp8 把 KV 显存再砍半 |
-# | `--max-num-seqs`（`max_num_seqs`） | 公式里的 B | 同时在跑的请求数上限 |
+# | `--block-size` | 03 章：分页粒度 | 默认 16；本章的连续预分配相当于 block_size = max_model_len |
+# | `--gpu-memory-utilization` | KV 显存预算 | 默认 0.9，留 10% 给激活值/临时 buffer |
+# | `--max-model-len` | 公式里的 S | 直接决定单请求 KV 上限 |
+# | `--kv-cache-dtype` | 公式里的 dtype_bytes | `auto` / `fp8`；fp8 把 KV 显存再砍半 |
+# | `--max-num-seqs` | 公式里的 B | 同时在跑的请求数上限 |
 #
 # **差距在哪**：vLLM 不预分配 `(B,H,S,D)`，而是先按 `gpu_memory_utilization` 算出能开多少
-# 个 KV block（`num_gpu_blocks`），再按 block 粒度分给请求。这样同一张卡上不同长度的请求
-# 可以共享显存池，且能实现 03 章的分页、04 章的前缀共享。我们本章的连续实现则要求
-# 每个请求独占 `max_seq_len`——这就是下一章要动手解决的问题。
-#
-# 另外，本章的 `attention_with_cache` 用 Python 构造 `(T, S)` 的 mask 再 `softmax`，
-# 而 vLLM 的 kernel 把 mask、RoPE、softmax 全部 fused 进 CUDA kernel，并且直接按 block 读
-# KV cache、不做任何 gather/拷贝。100 行 vs 10000 行的差距主要在这里。
+# 个 KV block（`num_gpu_blocks`），再按 block 粒度分给请求。这样不同长度的请求共享显存池，
+# 且能实现 03 章的分页、04 章的前缀共享。本章的连续实现要求每个请求独占 `max_seq_len`——
+# 这就是下一章要动手解决的问题。
 
 # %% [markdown]
-# ## 02.5 练习与小结
+# ## 02.6 练习与小结
 #
 # **练习**
 #
 # 1. ⭐ 把 `KVCache` 的 `dtype` 从 `float32` 换成 `bfloat16`，重跑显存表与延迟表。显存应该减半，
-#    延迟会减半吗？为什么（提示：看 decode 是 bandwidth-bound 还是 compute-bound，以及 MPS 的
-#    dtype 支持）？
+#    延迟会减半吗？为什么（提示：decode 是带宽受限还是算力受限？MPS 对 dtype 的支持如何）？
 # 2. ⭐ 在 prefill/decode 表里补上 batch=1 与 batch=32 两行，画出「decode 吞吐 vs batch」。
-#    用「每步要读的字节数 ÷ 显存带宽」解释这条曲线的形状。
+#    用「每步要读的字节数 ÷ 显存带宽」解释曲线形状。
 # 3. ⭐⭐ 给 `KVCache` 加上 `reset()`，复用同一块显存连续跑两轮生成，验证第二轮不需要重新分配
 #    显存（提示：记录 `torch.mps.current_allocated_memory()` 或 CPU 上的 `id()`）。
 # 4. ⭐⭐ 把 `attention_with_cache` 里的显式 mask 换成两段式 `F.scaled_dot_product_attention`
-#    （前缀部分 `is_causal=False`，当前块 `is_causal=True`），验证 logits 与本章实现一致
-#    （`atol=1e-3`），并对比 MPS 上的延迟。
+#    （前缀 `is_causal=False`，当前块 `is_causal=True`），验证 logits 一致（`atol=1e-3`），
+#    并对比 MPS 上的延迟。
 # 5. ⭐⭐⭐ 容量规划：给定 SLO（TTFT < 300ms、TPOT < 30ms、并发 32），用本章公式推导
 #    Qwen3-8B fp16 在 80GB 卡上的最大上下文长度。列出 3 条让你不敢直接采信这个数字的
-#    不确定性来源（评分要点：是否用了 GQA 的 KV 头数、是否给权重/激活值留了空间、
-#    是否区分了 prefill 与 decode 的预算、是否提到 PagedAttention 的碎片）。
+#    不确定性来源（评分要点：GQA 的 KV 头数、权重/激活值预留、prefill 与 decode 的预算、
+#    PagedAttention 碎片）。
 #
 # **你现在应该能回答：**
 #
@@ -596,13 +648,14 @@ print(f"生成 1536 个 token：naive 约 {total_naive[-1] / 1000:.1f}s vs cache
 #
 # **小结与下一章**
 #
-# 本章的 KV cache 是**连续预分配**的：每个请求按 `max_seq_len` 占一块显存。它简单、attention
-# 零拷贝，但 200 个长短不一的请求会让 74% 的显存变成碎片（下一章实测），而且相同前缀
-# 无法共享。03 章引入分页（PagedAttention）：把 KV 切成固定大小的 block，用 block table
-# 把逻辑位置映射到物理 block——本章的 `append/get/advance/seq_len` 接口保持不变。
+# 本章的 KV cache 是**连续预分配**：每个请求按 `max_seq_len` 占一块显存。它简单、attention
+# 零拷贝，但 200 个长短不一的请求会让 74% 的显存变成碎片（下一章实测），相同前缀也无法共享。
+# 03 章引入分页（PagedAttention）：把 KV 切成固定大小的 block，用 block table 把逻辑位置
+# 映射到物理 block——本章的 `append/get/advance/seq_len` 接口保持不变。
 #
 # **延伸阅读**
 #
 # - Kwon et al., *PagedAttention / vLLM*（SOSP 2023）：第 3 节的 KV cache 显存浪费分析
 # - vLLM 文档：`gpu_memory_utilization`、`max_model_len` 与 KV cache 容量计算
 # - 下一章：03 PagedAttention，把本章的「预分配 + 连续布局」换成「按需 + 分页」
+
