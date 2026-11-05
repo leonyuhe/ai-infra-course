@@ -78,9 +78,21 @@
 # %% [markdown]
 # ## 01.2 从零实现
 #
-# ### 1) 先看我们手里的实验对象
+# ### 1) 先看全貌：一个 token 是怎么变成下一个 token 的
 #
-# `TinyGPT` 与 Llama 同构（RMSNorm + RoPE + MHA + SwiGLU），约 2.8M 参数，随机权重。我们只关心它的**形状和字节数**，不关心它生成什么。
+# 01.1 讲了"算"和"搬"，这一节把它落到一个具体模型上。实验对象 `TinyGPT` 与 Llama 同构（RMSNorm + RoPE + MHA + SwiGLU），
+# 只是缩小到约 2.8M 参数。整条流水线是：
+#
+# ![](../assets/figures/ch01_pipeline.svg)
+#
+# 生成一个 token，就是把这条流水线跑一次：
+#
+# 1. **token id → 向量**：查 embedding 表（4096 × 256），把每个 id 变成 256 维向量；
+# 2. **2 × Transformer Block**：每层先做 attention（让每个位置"看"前面的位置），再做 SwiGLU MLP（逐位置变换）；
+# 3. **LM head**：把最后位置的 256 维隐藏向量乘成 4096 维 logits——词表里每个 token 一个原始分数；
+# 4. **softmax → 概率 → 采样**：按概率抽一个 token，接到序列末尾，再跑下一次。
+#
+# 权重是随机的，所以它生成的"话"是乱码。**本章只关心形状、字节数和耗时**，不关心生成质量。
 
 # %%
 import math
@@ -110,7 +122,9 @@ model = TinyGPT(cfg).to(device).eval()
 print("device =", device, "| params =", f"{model.num_params():,}")
 
 # %% [markdown]
-# 把参数账本拆开：哪一层占多少字节，决定了 decode 每步要读多少内存。
+# ### 2) 参数账本：decode 每步要搬多少字节
+#
+# 先把参数按层拆开。decode 时每一步都要把**全部参数**从内存读进计算单元，所以这张表就是"每 token 的搬运量账本"。
 
 # %%
 rows = []
@@ -121,9 +135,48 @@ params_df = pd.DataFrame(rows)
 params_df
 
 # %% [markdown]
-# ### 2) 手写一次 attention，并与框架实现对照
+# 合计 **2,753,792 个参数 × 4 字节 = 11,015,168 字节 ≈ 10.5 MiB**。
 #
-# 所有"分页""批处理"的花活，底层都是这一个公式。先确认我们理解的和 PyTorch 做的是同一件事：
+# 这个数字就是 01.1 里"decode 吃带宽"的具体化：每生成 1 个 token，都要把这 10.5 MiB 权重从内存搬到计算单元。
+# 用 01.3 测出的带宽一除就是理论上限；而 TinyGPT 只有 10.5 MiB，固定开销会盖过带宽（01.3 会看到"理论 5 万、实测几百"）。
+# 换成 8B 模型（fp16 约 16 GB）时，固定开销可以忽略，带宽才成为真正的硬上限。
+
+# %% [markdown]
+# ### 3) 跑一次前向，看清每一层的形状
+#
+# 把形状打印出来，比读代码更直观。**`(B, S, d_model)` 贯穿整个网络**，最后一步才变成 `(B, S, vocab)`。
+
+# %%
+ids = torch.randint(0, cfg.vocab_size, (1, 6), device=device)
+x = model.tok_emb(ids)
+print("token ids     ", tuple(ids.shape))
+print("embedding     ", tuple(x.shape))
+for i, block in enumerate(model.blocks):
+    x = block(x)
+    print(f"block {i} output", tuple(x.shape))
+hidden = model.norm_f(x)
+logits = model.lm_head(hidden)
+print("hidden        ", tuple(hidden.shape))
+print("logits        ", tuple(logits.shape))
+assert logits.shape == (1, 6, cfg.vocab_size)
+
+# %% [markdown]
+# 生成时只取**最后一个位置**：`logits[:, -1, :]`，形状 `(1, 4096)`。
+# 因为这个位置已经通过 attention"看过"前面的所有 token，它的 hidden 就是整段上下文的压缩表示；
+# 乘上 LM head 后，它变成"下一个 token 是谁"的 4096 个分数。
+
+# %% [markdown]
+# ### 4) attention：每个位置如何"看"前面的位置
+#
+# attention 做三件事（Q、K、V 都是同一个输入乘三个不同矩阵得到的）：
+#
+# | 步骤 | 公式 | 直觉 |
+# | --- | --- | --- |
+# | 打分 | Q · Kᵀ / √d | 当前 token 对每个历史 token 的"相关度" |
+# | 归一化 | softmax(·) + 因果掩码 | 只能看自己和之前，权重和为 1 |
+# | 聚合 | 权重 · V | 按相关度把历史信息加权求和 |
+#
+# 手写一遍，是为了把公式和形状钉死，再和 PyTorch 的融合实现对照。
 
 # %%
 B, T, H, D = 2, 64, 4, 64
@@ -131,10 +184,11 @@ q, k, v = (torch.randn(B, H, T, D, device=device) for _ in range(3))
 
 
 def manual_attention(q, k, v):
-    scores = q @ k.transpose(-2, -1) / math.sqrt(D)  # (B,H,T,T)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(D)       # (B,H,T,T) 两两相关度
     mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=q.device), diagonal=1)
-    scores = scores.masked_fill(mask, float("-inf"))
-    return F.softmax(scores, dim=-1) @ v
+    scores = scores.masked_fill(mask, float("-inf"))      # 因果掩码：屏蔽未来位置
+    weights = F.softmax(scores, dim=-1)                   # 每个 query 的权重和为 1
+    return weights @ v                                    # 按权重聚合 value
 
 
 ours = manual_attention(q, k, v)
@@ -143,9 +197,42 @@ assert torch.allclose(ours, ref, atol=1e-5), "手写 attention 与框架实现�
 print("✅ 手写 attention 与 SDPA 一致，最大误差 =", (ours - ref).abs().max().item())
 
 # %% [markdown]
-# ### 3) 采样：贪心、温度、top-k
+# **SDPA 是什么？** `torch.nn.functional.scaled_dot_product_attention` 是 PyTorch 2.0 起的融合算子：
+# 数学上就是上面那三行，实现上会按硬件自动选择 FlashAttention / memory-efficient / 朴素 kernel。
+# vLLM 生产里用的就是这一类融合 attention kernel。
 #
-# 模型输出 logits，采样策略决定下一个 token。三个断言把行为钉死：贪心必须确定性、温度趋近 0 必须退化成贪心、top-k 必须屏蔽掉低概率 token。
+# 那为什么还要手写？三个原因：
+#
+# 1. **验证理解**：等价断言就是测试，证明公式没记错；
+# 2. **留下参考实现**：第 03 章把连续 KV 换成 block table 分页后，用这个朴素版校验结果是否正确；
+# 3. **看清成本**：打分矩阵是 S × S，attention 是 O(S²) 计算 + 每层 O(S) 的 KV 读写——这正是后面 chunked prefill、前缀缓存要优化的地方。
+
+# %% [markdown]
+# ### 5) 采样：从最后一维向量到下一个 token
+#
+# 最后一个位置的 hidden 是一个 256 维向量，它本身不是词，可以理解为"到目前为止整段上下文"的压缩表示。
+# LM head 把它乘成 4096 维 **logits**：词表里每个 token 一个分数。softmax 之后就是概率分布。
+#
+# 三种最常见的采样策略：
+#
+# - **贪心（temperature = 0）**：直接取分数最高的 token。确定、可复现，适合评测。
+# - **温度 T**：把 logits 除以 T。T < 1 分布更尖（更保守），T > 1 更平（更随机）。
+# - **top-k**：只保留分数最高的 k 个，重新归一化后再采样，砍掉长尾乱码。
+#   （top-p 是同一类思路：保留累计概率到 p 的最小集合。）
+#
+# 用同一组 logits 看温度怎么改变概率：
+
+# %%
+raw = torch.tensor([1.0, 2.0, 3.0, 4.0], device=device)
+rows = []
+for T in [0.5, 1.0, 2.0]:
+    probs = F.softmax(raw / T, dim=-1)
+    rows.append({"温度 T": T, **{f"token {i}": round(float(probs[i]), 3) for i in range(4)}})
+pd.DataFrame(rows)
+
+# %% [markdown]
+# 三个断言把采样行为钉死：贪心必须确定性、温度趋近 0 必须退化成贪心、top-k 必须屏蔽低概率 token。
+# 再跑 4000 次，验证经验频率收敛到 softmax 概率：
 
 # %%
 logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=device)
@@ -163,6 +250,15 @@ pd.DataFrame(
         "采样 4000 次频率": empirical.tolist(),
     }
 ).round(3)
+
+# %% [markdown]
+# ### 6) 回到 infra：这一章在算什么
+#
+# 采样本身几乎不耗算力（一次 argmax / multinomial），但它决定了输出风格，也是 OpenAI API 里 `temperature`、`top_p` 参数的来源。
+#
+# 一次 forward 的成本集中在两处：**attention**（O(S²) 分数矩阵 + KV 读写）和 **LM head**（d × V 的大矩阵乘）。
+# 生成时每走一步，还要把全部权重读一遍——TinyGPT 是 10.5 MiB，8B 模型是 16 GB。
+# 01.3 我们就把这三个数字亲手测出来：带宽、prefill 吞吐、decode tok/s。
 
 # %% [markdown]
 # ## 01.3 实测：算力、带宽与 roofline

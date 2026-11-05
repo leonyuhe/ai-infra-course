@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="960" height="540" role="img" aria-labelledby="t d">
+  <title id="t">TinyGPT pipeline: from token ids to the next token</title>
+  <desc id="d">Embedding, transformer blocks, LM head, logits, softmax and sampling, with the block internals expanded below.</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7280"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="540" fill="#FFFFFF"/>
+  <text x="40" y="42" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="700" fill="#111827">One token in, one token out: what TinyGPT actually computes</text>
+  <text x="40" y="68" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#6B7280">B = batch, S = sequence length, d = 256, V = 4096 (vocab), 2 blocks, random weights</text>
+
+  <!-- top pipeline -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="30" y="92" width="112" height="76" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="86" y="120" text-anchor="middle" font-size="13" font-weight="700" fill="#1E3A8A">token ids</text>
+    <text x="86" y="142" text-anchor="middle" font-size="12" fill="#374151">(B, S)</text>
+    <text x="86" y="160" text-anchor="middle" font-size="11" fill="#6B7280">int64</text>
+
+    <rect x="162" y="92" width="112" height="76" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="218" y="120" text-anchor="middle" font-size="13" font-weight="700" fill="#1E3A8A">Embedding</text>
+    <text x="218" y="142" text-anchor="middle" font-size="12" fill="#374151">(B, S, d)</text>
+    <text x="218" y="160" text-anchor="middle" font-size="11" fill="#6B7280">V × d table</text>
+
+    <rect x="294" y="92" width="112" height="76" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2"/>
+    <text x="350" y="120" text-anchor="middle" font-size="13" font-weight="700" fill="#065F46">Block × 2</text>
+    <text x="350" y="142" text-anchor="middle" font-size="12" fill="#374151">(B, S, d)</text>
+    <text x="350" y="160" text-anchor="middle" font-size="11" fill="#6B7280">attention + MLP</text>
+
+    <rect x="426" y="92" width="112" height="76" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+    <text x="482" y="120" text-anchor="middle" font-size="13" font-weight="700" fill="#1E3A8A">LM head</text>
+    <text x="482" y="142" text-anchor="middle" font-size="12" fill="#374151">d × V matmul</text>
+    <text x="482" y="160" text-anchor="middle" font-size="11" fill="#6B7280">tied weights</text>
+
+    <rect x="558" y="92" width="112" height="76" rx="8" fill="#FFF7ED" stroke="#F59E0B" stroke-width="2"/>
+    <text x="614" y="120" text-anchor="middle" font-size="13" font-weight="700" fill="#92400E">logits</text>
+    <text x="614" y="142" text-anchor="middle" font-size="12" fill="#374151">(B, S, V)</text>
+    <text x="614" y="160" text-anchor="middle" font-size="11" fill="#6B7280">one score per word</text>
+
+    <rect x="690" y="92" width="112" height="76" rx="8" fill="#FFF7ED" stroke="#F59E0B" stroke-width="2"/>
+    <text x="746" y="120" text-anchor="middle" font-size="13" font-weight="700" fill="#92400E">softmax</text>
+    <text x="746" y="142" text-anchor="middle" font-size="12" fill="#374151">(B, S, V)</text>
+    <text x="746" y="160" text-anchor="middle" font-size="11" fill="#6B7280">probabilities</text>
+
+    <rect x="822" y="92" width="108" height="76" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2"/>
+    <text x="876" y="120" text-anchor="middle" font-size="13" font-weight="700" fill="#991B1B">sample</text>
+    <text x="876" y="142" text-anchor="middle" font-size="12" fill="#374151">next token</text>
+    <text x="876" y="160" text-anchor="middle" font-size="11" fill="#6B7280">greedy / T / top-k</text>
+  </g>
+
+  <g stroke="#6B7280" stroke-width="2" marker-end="url(#a)">
+    <line x1="144" y1="130" x2="158" y2="130"/>
+    <line x1="276" y1="130" x2="290" y2="130"/>
+    <line x1="408" y1="130" x2="422" y2="130"/>
+    <line x1="540" y1="130" x2="554" y2="130"/>
+    <line x1="672" y1="130" x2="686" y2="130"/>
+    <line x1="804" y1="130" x2="818" y2="130"/>
+  </g>
+
+  <!-- generation loop note -->
+  <path d="M 876 172 L 876 208 L 86 208 L 86 172" fill="none" stroke="#EF4444" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#a)"/>
+  <text x="480" y="228" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#991B1B">autoregressive loop: append the sampled token and run again (decode: S = 1, everything above is one column)</text>
+
+  <!-- block internals -->
+  <text x="40" y="280" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#111827">Inside one Block (pre-norm, residual connections)</text>
+
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="60" y="300" width="120" height="60" rx="8" fill="#F3F4F6" stroke="#6B7280" stroke-width="2"/>
+    <text x="120" y="326" text-anchor="middle" font-size="12" font-weight="700" fill="#111827">RMSNorm</text>
+    <text x="120" y="346" text-anchor="middle" font-size="11" fill="#6B7280">(B,S,d)</text>
+
+    <rect x="210" y="300" width="150" height="60" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2"/>
+    <text x="285" y="326" text-anchor="middle" font-size="12" font-weight="700" fill="#065F46">Attention</text>
+    <text x="285" y="346" text-anchor="middle" font-size="11" fill="#6B7280">Q·Kᵀ → softmax → ·V</text>
+
+    <rect x="390" y="300" width="90" height="60" rx="8" fill="#FFF7ED" stroke="#F59E0B" stroke-width="2"/>
+    <text x="435" y="330" text-anchor="middle" font-size="18" font-weight="700" fill="#92400E">+</text>
+    <text x="435" y="350" text-anchor="middle" font-size="11" fill="#6B7280">residual</text>
+
+    <rect x="520" y="300" width="120" height="60" rx="8" fill="#F3F4F6" stroke="#6B7280" stroke-width="2"/>
+    <text x="580" y="326" text-anchor="middle" font-size="12" font-weight="700" fill="#111827">RMSNorm</text>
+    <text x="580" y="346" text-anchor="middle" font-size="11" fill="#6B7280">(B,S,d)</text>
+
+    <rect x="670" y="300" width="150" height="60" rx="8" fill="#ECFDF5" stroke="#10B981" stroke-width="2"/>
+    <text x="745" y="326" text-anchor="middle" font-size="12" font-weight="700" fill="#065F46">SwiGLU MLP</text>
+    <text x="745" y="346" text-anchor="middle" font-size="11" fill="#6B7280">d → 4d → d</text>
+
+    <rect x="850" y="300" width="80" height="60" rx="8" fill="#FFF7ED" stroke="#F59E0B" stroke-width="2"/>
+    <text x="890" y="330" text-anchor="middle" font-size="18" font-weight="700" fill="#92400E">+</text>
+    <text x="890" y="350" text-anchor="middle" font-size="11" fill="#6B7280">residual</text>
+  </g>
+
+  <g stroke="#6B7280" stroke-width="2" marker-end="url(#a)">
+    <line x1="180" y1="330" x2="206" y2="330"/>
+    <line x1="360" y1="330" x2="386" y2="330"/>
+    <line x1="480" y1="330" x2="516" y2="330"/>
+    <line x1="640" y1="330" x2="666" y2="330"/>
+    <line x1="820" y1="330" x2="846" y2="330"/>
+  </g>
+
+  <!-- cost annotations -->
+  <rect x="40" y="400" width="420" height="100" rx="8" fill="#FEF2F2" stroke="#EF4444" stroke-width="2"/>
+  <text x="56" y="426" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#991B1B">Where the time goes</text>
+  <text x="56" y="450" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#7F1D1D">attention: O(S²) scores + O(S) KV read/write per layer</text>
+  <text x="56" y="470" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#7F1D1D">LM head: one d × V matmul per position</text>
+  <text x="56" y="490" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#7F1D1D">sampling: negligible FLOPs (argmax / multinomial)</text>
+
+  <rect x="480" y="400" width="450" height="100" rx="8" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
+  <text x="496" y="426" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#1E3A8A">Where the bytes go</text>
+  <text x="496" y="450" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#1E3A8A">prefill: weights read once, reused across S positions</text>
+  <text x="496" y="470" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#1E3A8A">decode: all weights streamed again for every single token</text>
+  <text x="496" y="490" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#1E3A8A">TinyGPT: 2.75M params × 4 B = 11,015,168 B ≈ 10.5 MiB</text>
+</svg>
