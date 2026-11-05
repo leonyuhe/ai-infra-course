@@ -444,7 +444,7 @@ print(f"对应权重读取带宽: {achieved_bw:.1f} GB/s  (实测峰值 {bw_meas
 # 所以性能估算要"账本推算 + 大模型实测"结合，不能拿玩具模型的绝对值外推。
 
 # %% [markdown]
-# ### 实测 4：把"搬数据"和"算数"放到一张图上（roofline）
+# ### 实测 4：两个上限——搬数据 vs 算数
 #
 # 一次前向的耗时，可以近似看成两个时间里的较大者：
 #
@@ -454,37 +454,39 @@ print(f"对应权重读取带宽: {achieved_bw:.1f} GB/s  (实测峰值 {bw_meas
 # 实际耗时   ≈ max(搬数据时间, 计算时间)
 # ```
 #
-# 用运输来类比这两件事：
+# 把 GPU 想成一座工厂：
 #
-# - **GPU 是工厂**，算力是它每秒能加工多少件货（FLOPS）；
-# - **内存带宽是连接仓库和工厂的公路**，每秒能运多少字节；
-# - **token 是要加工的货物**。decode 时每个 token 单独发一车 16 GB 的货（权重），
-#   运力都花在重复运同一批货上，工厂反而吃不饱——瓶颈在公路；
-# - prefill 时 2048 个 token 拼成一车货，每件货只分摊一点点运费，工厂满负荷——瓶颈在工厂。
+# - **工厂产能 = 算力**（每秒能完成多少 FLOPs）；
+# - **公路运力 = 内存带宽**（每秒能运多少字节）；
+# - **货物 = 字节**。每个 token 都要运一车"权重"（8B fp16 是 16 GB）：
+#   decode 每个 token 单独发一车；prefill 是 2048 个 token 拼一车，权重读取被 2048 个 token 摊薄。
 #
-# 一车货值不值得运，取决于"每字节货物能加工多少次"：
-# decode 每字节只加工 1 次，运费占绝对大头；prefill 每字节能加工 2048 次，运费可忽略。
-# 这个"每字节加工次数"就是横轴——**算术强度（AI）**：
+# 一种"活"划不划算，取决于**每搬 1 字节能换来多少次加工**——这是活本身的性质，叫**算术强度（AI）**：
 #
 # ```
 # AI = FLOPs ÷ 字节数
-# 内存受限（公路先满）：可达性能 = 带宽 × AI
-# 计算受限（工厂先满）：可达性能 = 峰值 FLOPS
+# decode（8B fp16）：16 GFLOP ÷ 16 GB = 1
+# prefill（T=2048）：32.8 TFLOP ÷ 16 GB = 2048
 # ```
 #
-# 工厂产能和公路运力各是一条上限，实际性能取较低的那条。
-# **修路一开始收益巨大；修到工厂先到上限时，再修路也没用**——这就是 roofline 曲线"先斜后平"的由来。
+# 对一台固定机器，可达性能取两个上限中较低的那个：
+#
+# ```
+# 可达 FLOP/s = min(带宽 × AI, 峰值算力)
+# ````
+#
+# 注意：**AI 不是带宽**。AI 的单位是 FLOP/byte，描述"这批数据能被加工多少次"；带宽的单位是 byte/s，描述"路有多宽"。
 
 # %% [markdown]
 # 怎么读这张图：
 #
-# - **横轴（对数）**：每字节货物能加工多少次（算术强度），越往右越"值钱"；
-# - **纵轴（对数）**：每秒能完成多少浮点运算（TFLOP/s）；
-# - **红色斜线**：公路先满时，性能 = `带宽 × AI`；
-# - **紫色横线**：工厂产能上限；
-# - **曲线**：取两者较小值，所以"先斜后平"。
+# - **横轴（对数）**：算术强度 AI——每搬 1 字节能换来多少次加工，这是**活的性质**，不是带宽；
+# - **纵轴（对数）**：可达性能（TFLOP/s）；
+# - **红色斜线**：`带宽 × AI`。带宽决定这条线的**斜率**：带宽越大，斜线越陡；
+# - **紫色横线**：算力上限；
+# - **实际性能取两者较小值**，所以曲线"先斜后平"。
 #
-# 交点就是**平衡点** `AI* = 峰值 FLOPS ÷ 带宽`：左边由公路决定，右边由工厂决定。
+# 交点 `AI* = 峰值算力 ÷ 带宽` 是平衡点：左边由带宽决定，右边由算力决定。
 
 # %%
 a = torch.randn(4096, 4096, device=device)
@@ -493,8 +495,84 @@ peak_tflops = 2 * 4096**3 / (r.median_ms / 1000) / 1e12
 print(f"实测峰值算力 ≈ {peak_tflops:.1f} TFLOP/s | 实测带宽 ≈ {bw_measured:.0f} GB/s")
 print(f"平衡点 AI* ≈ {peak_tflops * 1e12 / (bw_measured * 1e9):.0f} FLOP/byte")
 
+# %%
+ai = np.logspace(-1, 4, 200)
+roof = np.minimum(bw_measured * 1e9 * ai, peak_tflops * 1e12) / 1e12
+balance_ai = peak_tflops * 1e12 / (bw_measured * 1e9)
+
+fig, ax = plt.subplots(figsize=(7.4, 4.6))
+ax.loglog(ai, roof, color="#2563EB", lw=2.5, label="achievable = min(BW x AI, peak)")
+ax.axhline(peak_tflops, color="#7C3AED", ls="--", lw=1.5, label=f"compute roof ~ {peak_tflops:.1f} TFLOP/s")
+ax.axvline(balance_ai, color="#9CA3AF", ls=":", lw=1)
+ax.annotate(
+    f"balance ~ {balance_ai:.0f} FLOP/byte",
+    (balance_ai, peak_tflops),
+    xytext=(-170, -46),
+    textcoords="offset points",
+    fontsize=9,
+    color="#6B7280",
+)
+for x, y, label, color in [
+    (1.0, min(bw_measured * 1e9, peak_tflops * 1e12) / 1e12, "decode\nbandwidth-bound", "#EF4444"),
+    (2048.0, peak_tflops, "prefill T=2048\ncompute-bound", "#10B981"),
+]:
+    ax.scatter([x], [y], s=80, color=color, zorder=5)
+    offset = (-150, -42) if x > 100 else (8, 12)
+    ax.annotate(label, (x, y), xytext=offset, textcoords="offset points", fontsize=9, color=color)
+ax.set_xlabel("arithmetic intensity = FLOPs per byte read")
+ax.set_ylabel("achievable performance (TFLOP/s)")
+ax.set_title("Roofline: bandwidth sets the slope, compute sets the roof")
+ax.legend(loc="lower right", fontsize=9)
+save(fig, "ch01_roofline");
+
 # %% [markdown]
-# 把 8B fp16 模型的两种负载代入公式，直接算"两个时间"：
+# ### 如果固定一种活、只加带宽，会怎样？
+#
+# 上面的图横轴是 AI。工程师更常问的是另一个问题：**对这个模型，我换更宽的公路（加带宽）有用吗？**
+# 这就是把 AI 固定、只让带宽变化，画出来的另一张图：
+#
+# ```
+# 可达 FLOP/s = min(带宽 × AI, 峰值算力)
+# tokens/s    = 可达 FLOP/s ÷ 每 token FLOPs
+# ```
+#
+# - decode：AI = 1，`min(带宽, 16 TFLOP/s)`——带宽翻倍，tokens/s 也翻倍，直到带宽大到 16 TB/s 才撞到工厂上限；
+# - prefill：AI = 2048，`min(带宽 × 2048, 16 TFLOP/s)`——只要带宽超过约 8 GB/s 就已经在工厂上限上，**再加带宽毫无作用**。
+
+# %%
+bw_grid = np.logspace(np.log10(50), np.log10(20000), 120)
+peak_flops = peak_tflops * 1e12
+weights_bytes = 8e9 * 2
+per_token_flops = 2 * 8e9
+
+
+def tokens_vs_bw(ai_value: float) -> np.ndarray:
+    return np.minimum(bw_grid * 1e9 * ai_value, peak_flops) / per_token_flops
+
+
+fig, ax = plt.subplots(figsize=(7.4, 4.4))
+ax.plot(bw_grid, tokens_vs_bw(1.0), label="decode (AI = 1)")
+ax.plot(bw_grid, tokens_vs_bw(2048.0), label="prefill T=2048 (AI = 2048)")
+ax.axvline(bw_measured, color="#9CA3AF", ls=":", lw=1)
+ax.annotate("this Mac", (bw_measured, 3.0), xytext=(-44, 6), textcoords="offset points", fontsize=9, color="#6B7280")
+ax.set_xscale("log")
+ax.set_yscale("log")
+ax.set_xlabel("memory bandwidth (GB/s, log)")
+ax.set_ylabel("tokens/s (log)")
+ax.set_title("Fixed workload: more bandwidth helps only until the compute roof")
+ax.legend()
+save(fig, "ch01_bandwidth_sweep");
+
+# %% [markdown]
+# 这张图就是"加带宽"问题的答案：
+#
+# - **decode 一直贴着斜线**：AI=1，带宽就是唯一瓶颈，加带宽几乎线性提升（直到 16 TB/s 这种不现实的带宽）；
+# - **prefill 是水平线**：AI=2048，早就撞到算力屋顶，**再加带宽一点用都没有，只能加算力**。
+#
+# 所以"带宽有没有用"不能一概而论，要看负载的 AI：decode 吃带宽，prefill 吃算力。
+
+# %% [markdown]
+# 把 8B fp16 的两种负载代入公式，直接算"两个时间"：
 
 # %%
 P = 8e9
@@ -526,35 +604,6 @@ time_df = pd.DataFrame(
 time_df
 
 # %%
-ai = np.logspace(-1, 4, 200)
-roof = np.minimum(bw_measured * 1e9 * ai, peak_tflops * 1e12) / 1e12
-balance_ai = peak_tflops * 1e12 / (bw_measured * 1e9)
-
-fig, ax = plt.subplots(figsize=(7.4, 4.6))
-ax.loglog(ai, roof, color="#2563EB", lw=2.5, label="achievable = min(BW x AI, peak)")
-ax.axhline(peak_tflops, color="#7C3AED", ls="--", lw=1.5, label=f"compute roof ~ {peak_tflops:.1f} TFLOP/s")
-ax.axvline(balance_ai, color="#9CA3AF", ls=":", lw=1)
-ax.annotate(
-    f"balance ~ {balance_ai:.0f} FLOP/byte",
-    (balance_ai, peak_tflops),
-    xytext=(-170, -46),
-    textcoords="offset points",
-    fontsize=9,
-    color="#6B7280",
-)
-for x, y, label, color in [
-    (1.0, min(bw_measured * 1e9, peak_tflops * 1e12) / 1e12, "decode\nmemory-bound", "#EF4444"),
-    (2048.0, peak_tflops, "prefill T=2048\ncompute-bound", "#10B981"),
-]:
-    ax.scatter([x], [y], s=80, color=color, zorder=5)
-    ax.annotate(label, (x, y), xytext=(8, 12), textcoords="offset points", fontsize=9, color=color)
-ax.set_xlabel("arithmetic intensity = FLOPs per byte read")
-ax.set_ylabel("achievable performance (TFLOP/s)")
-ax.set_title("Roofline: the lower ceiling wins")
-ax.legend(loc="lower right", fontsize=9)
-save(fig, "ch01_roofline");
-
-# %%
 labels = ["decode", "prefill (T=2048)"]
 mem = time_df["内存时间(ms)"].to_numpy()
 comp = time_df["计算时间(ms)"].to_numpy()
@@ -577,8 +626,8 @@ save(fig, "ch01_time_breakdown");
 # %% [markdown]
 # 读表要点（8B fp16，数值随机器不同，比例关系是通用的）：
 #
-# - **decode**：每 token 读 16 GB 权重、只做 16 GFLOP，AI ≈ 1 → **内存时间远大于计算时间**，内存受限；
-# - **prefill T=2048**：权重还是 16 GB，但要算 32.8 TFLOP，AI ≈ 2048 → **计算时间远大于内存时间**，计算受限。
+# - **decode**：每 token 读 16 GB 权重、只做 16 GFLOP，AI ≈ 1 → 内存时间远大于计算时间，带宽受限；
+# - **prefill T=2048**：权重还是 16 GB，但要算 32.8 TFLOP，AI ≈ 2048 → 计算时间远大于内存时间，算力受限。
 #
 # 这就是 01.1 那句话的定量版本：prefill 也搬权重，但一次搬完被 2048 个 token 摊薄；
 # decode 每个 token 都要重新搬一遍，所以它卡在"搬"上。

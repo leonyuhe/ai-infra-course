@@ -25,6 +25,7 @@
 | 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 实测 4 改成运输类比（工厂/公路/货物、修路 vs 扩产），去掉对话口吻 | 本地 |
 | 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 01.4 重写：先解释“单请求→多请求”的变化，再逐条讲 4 个 vLLM 映射，并挂到后续章节 | 本地 |
 | 2026-11-05 | `notebooks/02_kv_cache.py` | 修正一处对话口吻（“给我……你能不能”） | 本地 |
+| 2026-11-05 | `notebooks/01_forward_and_sampling.py` | 实测 4 二修：统一工厂/公路/货物类比；明确 roofline 横轴是 AI 不是带宽；新增“固定负载只加带宽”第二张图（decode 线性上升、prefill 水平线） | 本地 |
 |  |  |  |  |
 
 ## 一次性发布 checklist（全部修订完成后）
