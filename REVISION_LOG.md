@@ -17,6 +17,7 @@
 | 2026-11-05 | `notebooks/05_scheduler.py` | decode 与 batch 的措辞对齐 | 已推送（7b17e37） |
 | 2026-11-05 | `tools/build_site.py` | 章节页 CI 执行提示条 | 已推送（7b17e37） |
 | 2026-11-05 | `REVISION_LOG.md` | 建立修订日志（本文件） | 本地 |
+| 2026-11-05 | `tools/build_site.py`、`.github/workflows/pages.yml` | 新增 `--ci-banner` 开关：本地预览不显示 CI 提示，线上构建才显示 | 本地 |
 |  |  |  |  |
 
 ## 一次性发布 checklist（全部修订完成后）

@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt && pip install -e .
       - name: Build static site (execute notebooks, export HTML)
-        run: python tools/build_site.py --out _site
+        run: python tools/build_site.py --out _site --ci-banner
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

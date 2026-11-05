@@ -173,10 +173,10 @@ BANNER = (
 )
 
 
-def inject(body: str, *, nav: str, root_prefix: str) -> str:
+def inject(body: str, *, nav: str, root_prefix: str, banner: str = "") -> str:
     head_add = f'<link rel="stylesheet" href="{root_prefix}style.css">'
     body = body.replace("</head>", head_add + "\n</head>", 1)
-    body = re.sub(r"(<body[^>]*>)", r"\1\n" + nav + BANNER, body, count=1)
+    body = re.sub(r"(<body[^>]*>)", r"\1\n" + nav + banner, body, count=1)
     return body
 
 
@@ -289,6 +289,7 @@ def main() -> int:
     ap.add_argument("--only", nargs="*", default=None, help="只构建指定章节，如 00 01")
     ap.add_argument("--no-execute", action="store_true", help="不执行代码，只导出静态 HTML（快速预览）")
     ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--ci-banner", action="store_true", help="页面顶部显示 CI 执行提示（仅线上构建使用）")
     args = ap.parse_args()
 
     import nbformat
@@ -328,7 +329,8 @@ def main() -> int:
 
         prev_href = f"{sources[i - 2].stem}.html" if i > 1 else None
         next_href = f"{sources[i].stem}.html" if i < len(sources) else None
-        page = inject(raw, nav=navbar(prev_href, next_href), root_prefix="../")
+        page = inject(raw, nav=navbar(prev_href, next_href), root_prefix="../",
+                      banner=BANNER if args.ci_banner else "")
         (out / "notebooks" / f"{stem}.html").write_text(page, encoding="utf-8")
 
     pdf_name = None
