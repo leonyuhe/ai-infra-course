@@ -144,7 +144,7 @@
             "index": 0,
             "message": {
               "role": "assistant",
-              "content": "{\"model\": \"qwen3-8b\", \"weights_gb\": 16.4, \"kv_budget_gb\": 55.6}"
+              "content": "{\"model\": \"qwen3-8b\", \"weights_gb\": 16.4, \"kv_budget_gb\": 53.6}"
             },
             "finish_reason": "stop"
           }
