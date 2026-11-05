@@ -7,6 +7,8 @@
 **在线阅读：<https://leonyuhe.github.io/ai-infra-course/>** ｜
 **PDF 讲义：<https://github.com/leonyuhe/ai-infra-course/releases>**
 
+<p align="center"><img src="assets/cover/ai-infra-course-cover.png" width="420" alt="AI Infra 从零构建 · 封面"></p>
+
 > 一套「先造轮子、再读工业实现」的 AI 推理基础设施课程。
 > 灵感来自 Sebastian Raschka 的 *Build a Large Language Model (From Scratch)*：
 > 每章先建立直觉 → 手写最小实现 → 亲手测量 → 对照 vLLM 源码 → 练习迁移。

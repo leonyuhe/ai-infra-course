@@ -62,7 +62,11 @@ th, td { border: 1px solid #E5E7EB; padding: 10px 12px; text-align: left; vertic
 th { background: #F9FAFB; }
 blockquote { border-left: 4px solid var(--accent); margin: 20px 0; padding: 4px 20px; color: #374151; background: #F8FAFC; }
 img { max-width: 100%; height: auto; }
-.input_prompt, .output_prompt, .prompt { display: none !important; }
+.cover { float: right; width: 300px; margin: 4px 0 28px 36px; border-radius: 6px;
+         box-shadow: 0 18px 40px rgba(0,0,0,.18); }
+@media (max-width: 720px) { .cover { float: none; width: 68%; display: block; margin: 0 auto 24px; } }
+.input_prompt, .output_prompt, .prompt,
+.jp-InputPrompt, .jp-OutputPrompt { display: none !important; }
 nav.topbar { position: sticky; top: 0; z-index: 10; background: rgba(255,255,255,.92);
              backdrop-filter: blur(8px); border-bottom: 1px solid #E5E7EB; }
 nav.topbar .inner { max-width: 880px; margin: 0 auto; padding: 10px 24px; font-size: 14px;
@@ -79,6 +83,8 @@ nav.topbar .spacer { flex: 1; }
 .btn:hover { text-decoration: none; opacity: .92; }
 .meta { color: var(--muted); font-size: 14px; }
 @media print {
+  @page { size: A4; margin: 15mm 13mm; }
+  @page :first { margin: 0; }
   nav.topbar { display: none; }
   .wrap { max-width: none; padding: 0; }
   .chapter { break-before: page; }
@@ -189,6 +195,7 @@ def build_index(chapters: list[dict], pdf_name: str | None) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{TITLE}</title><link rel="stylesheet" href="style.css"></head>
 <body><div class="wrap">
+<img class="cover" src="assets/cover/ai-infra-course-cover.png" alt="课程封面">
 <p class="meta">{VERSION} · 在线阅读版</p>
 <h1>{TITLE}</h1>
 <p class="lead">{SUBTITLE}</p>
@@ -216,13 +223,11 @@ def build_book(chapters: list[dict], chapter_html: dict[str, str]) -> str:
 <html lang="zh-CN"><head><meta charset="utf-8"><title>{TITLE}</title>
 {styles}
 <style>{CSS}
-.titlepage {{ text-align:center; padding-top: 30vh; }}
-.titlepage h1 {{ font-size: 44px; }}
-.titlepage .lead {{ font-size: 20px; }}
+.titlepage {{ min-height: 297mm; padding: 0; margin: 0; }}
+.titlepage img {{ width: 100%; height: 297mm; object-fit: cover; display: block; margin: 0; }}
 </style></head><body>
 <section class="chapter titlepage">
-  <h1>{TITLE}</h1><p class="lead">{SUBTITLE}</p>
-  <p class="meta">{VERSION} · leonyuhe</p>
+  <img src="assets/cover/ai-infra-course-cover.png" alt="cover">
 </section>
 {"".join(sections)}
 </body></html>"""
@@ -287,6 +292,9 @@ def main() -> int:
 
     if FIG_DIR.exists():
         shutil.copytree(FIG_DIR, out / "assets" / "figures", dirs_exist_ok=True)
+    cover_dir = ROOT / "assets" / "cover"
+    if cover_dir.exists():
+        shutil.copytree(cover_dir, out / "assets" / "cover", dirs_exist_ok=True)
     (out / "style.css").write_text(CSS, encoding="utf-8")
 
     sources = sorted(NB_DIR.glob("[0-9][0-9]_*.ipynb"))
